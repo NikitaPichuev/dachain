@@ -1,0 +1,12 @@
+{
+  "base_url": "https://inception.dachain.io",
+  "ref_code": "DAC1392613",
+  "request_timeout_seconds": 20,
+  "poll_timeout_seconds": 45,
+  "poll_interval_seconds": 3,
+  "delay_between_wallets_min_seconds": 3,
+  "delay_between_wallets_max_seconds": 6,
+  "delay_between_crates_min_seconds": 1,
+  "delay_between_crates_max_seconds": 3,
+  "cycle_proxies": true
+}
