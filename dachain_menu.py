@@ -59,11 +59,26 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "ref_code": "DAC1392613",
     "request_timeout_seconds": 20,
     "poll_timeout_seconds": 45,
+    "faucet_poll_timeout_seconds": 120,
+    "crate_poll_timeout_seconds": 90,
     "poll_interval_seconds": 3,
     "delay_between_wallets_min_seconds": 3,
     "delay_between_wallets_max_seconds": 6,
+    "delay_between_rank_mints_min_seconds": 1,
+    "delay_between_rank_mints_max_seconds": 4,
+    "use_proxy_for_rpc": True,
+    "delay_between_faucet_requests_min_seconds": 2,
+    "delay_between_faucet_requests_max_seconds": 5,
+    "faucet_busy_retry_count": 2,
+    "faucet_busy_retry_delay_min_seconds": 20,
+    "faucet_busy_retry_delay_max_seconds": 35,
     "delay_between_crates_min_seconds": 1,
     "delay_between_crates_max_seconds": 3,
+    "delay_between_crate_requests_min_seconds": 1,
+    "delay_between_crate_requests_max_seconds": 2,
+    "crate_retry_count": 2,
+    "crate_retry_backoff_min_seconds": 4,
+    "crate_retry_backoff_max_seconds": 8,
     "cycle_proxies": True,
 }
 
@@ -199,10 +214,39 @@ def create_run_logger(wallet_index: int, address: str) -> logging.Logger:
 
 def get_web3(entry: WalletEntry, settings: dict[str, Any]) -> Web3:
     request_kwargs: dict[str, Any] = {"timeout": int(settings["request_timeout_seconds"])}
-    if entry.proxy:
+    if entry.proxy and bool(settings.get("use_proxy_for_rpc", False)):
         request_kwargs["proxies"] = {"http": entry.proxy, "https": entry.proxy}
     provider = Web3.HTTPProvider(DAC_TESTNET_RPC_URL, request_kwargs=request_kwargs)
     return Web3(provider)
+
+
+def normalize_tx_hash(tx_hash: Any) -> str:
+    value = str(tx_hash or "").strip()
+    if value and not value.startswith("0x"):
+        return f"0x{value}"
+    return value
+
+
+def find_last_rank_tx_hash(address: str, rank_key: str) -> str | None:
+    if not APP_LOG_PATH.exists():
+        return None
+
+    current_badges_address: str | None = None
+    target_address = address.lower()
+    found: str | None = None
+
+    for raw_line in APP_LOG_PATH.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if "Wallet #" in line and "mode=badges" in line and "address=" in line:
+            current_badges_address = line.split("address=", 1)[1].split(" |", 1)[0].strip().lower()
+            continue
+
+        marker = f"Rank mint sent | rank_key={rank_key}"
+        if current_badges_address == target_address and marker in line and "tx_hash=" in line:
+            tx_hash = line.split("tx_hash=", 1)[1].split()[0].strip()
+            found = normalize_tx_hash(tx_hash)
+
+    return found
 
 
 def claim_early_badge(
@@ -250,10 +294,6 @@ def mint_rank_badges(
         log("No rank badges available for mint.")
         return True, profile, False
 
-    if dacc_balance <= 0:
-        log("SKIP: no gas | dacc_balance=%s | pending_rank_badges=%s", profile.get("dacc_balance"), len(rank_badges))
-        return False, profile, True
-
     try:
         w3 = get_web3(entry, settings)
         if not w3.is_connected():
@@ -264,14 +304,34 @@ def mint_rank_badges(
             abi=RANK_BADGE_ABI,
         )
         account = Account.from_key(entry.private_key if entry.private_key.startswith("0x") else f"0x{entry.private_key}")
+        onchain_balance_wei = w3.eth.get_balance(account.address)
+        onchain_balance = onchain_balance_wei / 10**18
+        log(
+            "RPC OK | address=%s | onchain_dacc_balance=%.18f | profile_dacc_balance=%s",
+            account.address,
+            onchain_balance,
+            profile.get("dacc_balance"),
+        )
     except Exception as exc:
         log_error("RANK MINT SETUP ERROR | %s", exc)
         return False, profile, True
 
+    if onchain_balance_wei <= 0:
+        log(
+            "SKIP: no onchain gas | onchain_dacc_balance=0 | profile_dacc_balance=%s | pending_rank_badges=%s",
+            profile.get("dacc_balance"),
+            len(rank_badges),
+        )
+        return False, profile, True
+
     all_ok = True
     current_profile = profile
+    rank_mint_delay_min = float(settings.get("delay_between_rank_mints_min_seconds", 1))
+    rank_mint_delay_max = float(settings.get("delay_between_rank_mints_max_seconds", 4))
+    if rank_mint_delay_max < rank_mint_delay_min:
+        rank_mint_delay_min, rank_mint_delay_max = rank_mint_delay_max, rank_mint_delay_min
 
-    for badge in rank_badges:
+    for badge_index, badge in enumerate(rank_badges):
         rank_key = badge.get("badge__key")
         try:
             signature_data = client.nft_claim_signature(rank_key)
@@ -279,40 +339,87 @@ def mint_rank_badges(
             signature_hex = str(signature_data["signature"])
             signature_bytes = bytes.fromhex(signature_hex.removeprefix("0x"))
 
+            already_minted = contract.functions.hasMinted(account.address, rank_id).call()
+            if already_minted:
+                previous_tx_hash = find_last_rank_tx_hash(account.address, str(rank_key))
+                if not previous_tx_hash:
+                    log(
+                        "SKIP: rank already minted onchain but tx hash not found | rank_key=%s | rank_id=%s",
+                        rank_key,
+                        rank_id,
+                    )
+                    current_profile = client.profile()
+                    all_ok = False
+                    continue
+
+                try:
+                    client.nft_confirm_mint(rank_key, previous_tx_hash)
+                    log("Rank mint recovered | rank_key=%s | tx_hash=%s", rank_key, previous_tx_hash)
+                    current_profile = client.profile()
+                except ApiError as exc:
+                    all_ok = False
+                    log_error(
+                        "RANK RECOVER API ERROR | rank_key=%s | status=%s | message=%s | payload=%s",
+                        rank_key,
+                        exc.status,
+                        exc,
+                        exc.payload,
+                    )
+                continue
+
             nonce = w3.eth.get_transaction_count(account.address)
             gas_price = w3.eth.gas_price
             function = contract.functions.claimRank(rank_id, signature_bytes)
             gas_estimate = function.estimate_gas({"from": account.address})
+            gas_limit = int(gas_estimate * 1.2) + 5000
+            estimated_fee_wei = gas_limit * gas_price
+            if onchain_balance_wei < estimated_fee_wei:
+                estimated_fee = estimated_fee_wei / 10**18
+                log(
+                    "SKIP: insufficient onchain gas | rank_key=%s | onchain_dacc_balance=%.18f | estimated_fee=%.18f",
+                    rank_key,
+                    onchain_balance_wei / 10**18,
+                    estimated_fee,
+                )
+                all_ok = False
+                continue
             tx = function.build_transaction(
                 {
                     "from": account.address,
                     "chainId": DAC_TESTNET_CHAIN_ID,
                     "nonce": nonce,
-                    "gas": int(gas_estimate * 1.2) + 5000,
+                    "gas": gas_limit,
                     "gasPrice": gas_price,
                 }
             )
             signed = account.sign_transaction(tx)
             tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-            tx_hash_hex = tx_hash.hex()
+            tx_hash_hex = normalize_tx_hash(tx_hash.hex())
             log("Rank mint sent | rank_key=%s | rank_id=%s | tx_hash=%s", rank_key, rank_id, tx_hash_hex)
 
             receipt = w3.eth.wait_for_transaction_receipt(
                 tx_hash,
                 timeout=max(int(settings["poll_timeout_seconds"]), 120),
             )
+            log("Rank mint receipt | rank_key=%s | status=%s | block=%s", rank_key, getattr(receipt, "status", None), getattr(receipt, "blockNumber", None))
             if getattr(receipt, "status", 0) != 1:
                 raise RuntimeError(f"Transaction reverted: {tx_hash_hex}")
 
             client.nft_confirm_mint(rank_key, tx_hash_hex)
             log("Rank mint confirmed | rank_key=%s | tx_hash=%s", rank_key, tx_hash_hex)
             current_profile = client.profile()
+            onchain_balance_wei = w3.eth.get_balance(account.address)
         except ApiError as exc:
             all_ok = False
             log_error("RANK MINT API ERROR | rank_key=%s | status=%s | message=%s | payload=%s", rank_key, exc.status, exc, exc.payload)
         except Exception as exc:
             all_ok = False
             log_error("RANK MINT ERROR | rank_key=%s | %s", rank_key, exc)
+
+        if badge_index < len(rank_badges) - 1 and rank_mint_delay_max > 0:
+            sleep_seconds = random.uniform(rank_mint_delay_min, rank_mint_delay_max)
+            log("Sleeping between rank mints | seconds=%.2f", sleep_seconds)
+            time.sleep(sleep_seconds)
 
     return all_ok, current_profile, True
 
@@ -398,6 +505,21 @@ def run_wallet(entry: WalletEntry, logger: logging.Logger) -> bool:
 def run_wallet_faucet_only(entry: WalletEntry, logger: logging.Logger) -> bool:
     settings = load_settings()
     run_logger = create_run_logger(entry.index, entry.address)
+    delay_between_faucet_requests_min = float(settings.get("delay_between_faucet_requests_min_seconds", 2))
+    delay_between_faucet_requests_max = float(settings.get("delay_between_faucet_requests_max_seconds", 5))
+    faucet_busy_retry_count = max(int(settings.get("faucet_busy_retry_count", 2)), 0)
+    faucet_busy_retry_delay_min = float(settings.get("faucet_busy_retry_delay_min_seconds", 20))
+    faucet_busy_retry_delay_max = float(settings.get("faucet_busy_retry_delay_max_seconds", 35))
+    if delay_between_faucet_requests_max < delay_between_faucet_requests_min:
+        delay_between_faucet_requests_min, delay_between_faucet_requests_max = (
+            delay_between_faucet_requests_max,
+            delay_between_faucet_requests_min,
+        )
+    if faucet_busy_retry_delay_max < faucet_busy_retry_delay_min:
+        faucet_busy_retry_delay_min, faucet_busy_retry_delay_max = (
+            faucet_busy_retry_delay_max,
+            faucet_busy_retry_delay_min,
+        )
 
     def log(message: str, *args: Any) -> None:
         logger.info(message, *args)
@@ -406,6 +528,13 @@ def run_wallet_faucet_only(entry: WalletEntry, logger: logging.Logger) -> bool:
     def log_error(message: str, *args: Any) -> None:
         logger.error(message, *args)
         run_logger.error(message, *args)
+
+    def sleep_range(min_seconds: float, max_seconds: float, message: str) -> None:
+        if max_seconds <= 0:
+            return
+        sleep_seconds = random.uniform(min_seconds, max_seconds)
+        log(message, sleep_seconds)
+        time.sleep(sleep_seconds)
 
     log("Wallet #%s | mode=faucet | address=%s | proxy=%s", entry.index, entry.address, entry.proxy or "-")
 
@@ -418,6 +547,11 @@ def run_wallet_faucet_only(entry: WalletEntry, logger: logging.Logger) -> bool:
 
     try:
         auth = client.authenticate_wallet(entry.address)
+        sleep_range(
+            delay_between_faucet_requests_min,
+            delay_between_faucet_requests_max,
+            "Sleeping between faucet requests | seconds=%.2f",
+        )
         profile = client.profile()
         log("Auth OK | created=%s | qe_balance=%s | dacc_balance=%s", auth.created, profile.get("qe_balance"), profile.get("dacc_balance"))
         log(
@@ -434,32 +568,43 @@ def run_wallet_faucet_only(entry: WalletEntry, logger: logging.Logger) -> bool:
         log_error("UNEXPECTED AUTH ERROR | %s", exc)
         return False
 
-    try:
-        claim = client.claim_faucet()
-        dispense_id = claim.get("dispense_id")
-        if not dispense_id:
-            log_error("FAUCET ERROR | unexpected response=%s", claim)
+    attempt = 0
+    while True:
+        try:
+            claim = client.claim_faucet()
+            dispense_id = claim.get("dispense_id")
+            if not dispense_id:
+                log_error("FAUCET ERROR | unexpected response=%s", claim)
+                return False
+
+            log("Faucet accepted | dispense_id=%s", dispense_id)
+            result = client.poll_dispense(
+                dispense_id,
+                timeout_seconds=int(settings.get("faucet_poll_timeout_seconds", settings["poll_timeout_seconds"])),
+                interval_seconds=float(settings["poll_interval_seconds"]),
+            )
+            status = result.get("status")
+            if status == "success":
+                log("FAUCET SUCCESS | final_status=%s | payload=%s", status, result)
+                return True
+
+            log_error("FAUCET FAILED | final_status=%s | payload=%s", status, result)
             return False
-
-        log("Faucet accepted | dispense_id=%s", dispense_id)
-        result = client.poll_dispense(
-            dispense_id,
-            timeout_seconds=int(settings["poll_timeout_seconds"]),
-            interval_seconds=float(settings["poll_interval_seconds"]),
-        )
-        status = result.get("status")
-        if status == "success":
-            log("FAUCET SUCCESS | final_status=%s | payload=%s", status, result)
-            return True
-
-        log_error("FAUCET FAILED | final_status=%s | payload=%s", status, result)
-        return False
-    except ApiError as exc:
-        log_error("FAUCET ERROR | status=%s | message=%s | payload=%s", exc.status, exc, exc.payload)
-        return False
-    except Exception as exc:
-        log_error("UNEXPECTED FAUCET ERROR | %s", exc)
-        return False
+        except ApiError as exc:
+            if exc.status == 503 and isinstance(exc.payload, dict) and exc.payload.get("code") == "backlog_full" and attempt < faucet_busy_retry_count:
+                attempt += 1
+                log_error("FAUCET BUSY | retry=%s/%s | message=%s", attempt, faucet_busy_retry_count, exc)
+                sleep_range(
+                    faucet_busy_retry_delay_min,
+                    faucet_busy_retry_delay_max,
+                    "Sleeping before faucet retry | seconds=%.2f",
+                )
+                continue
+            log_error("FAUCET ERROR | status=%s | message=%s | payload=%s", exc.status, exc, exc.payload)
+            return False
+        except Exception as exc:
+            log_error("UNEXPECTED FAUCET ERROR | %s", exc)
+            return False
 
 
 def run_wallet_badges_only(entry: WalletEntry, logger: logging.Logger) -> bool:
@@ -531,8 +676,20 @@ def run_wallet_crates_only(entry: WalletEntry, logger: logging.Logger) -> bool:
     run_logger = create_run_logger(entry.index, entry.address)
     delay_between_crates_min = float(settings.get("delay_between_crates_min_seconds", 1))
     delay_between_crates_max = float(settings.get("delay_between_crates_max_seconds", 3))
+    delay_between_crate_requests_min = float(settings.get("delay_between_crate_requests_min_seconds", 1))
+    delay_between_crate_requests_max = float(settings.get("delay_between_crate_requests_max_seconds", 2))
+    crate_retry_count = max(int(settings.get("crate_retry_count", 2)), 0)
+    crate_retry_backoff_min = float(settings.get("crate_retry_backoff_min_seconds", 4))
+    crate_retry_backoff_max = float(settings.get("crate_retry_backoff_max_seconds", 8))
     if delay_between_crates_max < delay_between_crates_min:
         delay_between_crates_min, delay_between_crates_max = delay_between_crates_max, delay_between_crates_min
+    if delay_between_crate_requests_max < delay_between_crate_requests_min:
+        delay_between_crate_requests_min, delay_between_crate_requests_max = (
+            delay_between_crate_requests_max,
+            delay_between_crate_requests_min,
+        )
+    if crate_retry_backoff_max < crate_retry_backoff_min:
+        crate_retry_backoff_min, crate_retry_backoff_max = crate_retry_backoff_max, crate_retry_backoff_min
 
     def log(message: str, *args: Any) -> None:
         logger.info(message, *args)
@@ -541,6 +698,31 @@ def run_wallet_crates_only(entry: WalletEntry, logger: logging.Logger) -> bool:
     def log_error(message: str, *args: Any) -> None:
         logger.error(message, *args)
         run_logger.error(message, *args)
+
+    def sleep_range(min_seconds: float, max_seconds: float, message: str) -> None:
+        if max_seconds <= 0:
+            return
+        sleep_seconds = random.uniform(min_seconds, max_seconds)
+        log(message, sleep_seconds)
+        time.sleep(sleep_seconds)
+
+    def call_with_retry(callback: Any, action_name: str) -> Any:
+        attempt = 0
+        while True:
+            try:
+                return callback()
+            except ApiError:
+                raise
+            except Exception as exc:
+                attempt += 1
+                if attempt > crate_retry_count:
+                    raise
+                log_error("%s NETWORK ERROR | attempt=%s/%s | %s", action_name, attempt, crate_retry_count, exc)
+                sleep_range(
+                    crate_retry_backoff_min,
+                    crate_retry_backoff_max,
+                    f"Sleeping before retrying {action_name} | seconds=%.2f",
+                )
 
     log("Wallet #%s | mode=crates | address=%s | proxy=%s", entry.index, entry.address, entry.proxy or "-")
 
@@ -552,9 +734,19 @@ def run_wallet_crates_only(entry: WalletEntry, logger: logging.Logger) -> bool:
     )
 
     try:
-        auth = client.authenticate_wallet(entry.address)
-        profile = client.profile()
-        history = client.crate_history()
+        auth = call_with_retry(lambda: client.authenticate_wallet(entry.address), "CRATE AUTH")
+        sleep_range(
+            delay_between_crate_requests_min,
+            delay_between_crate_requests_max,
+            "Sleeping between crate requests | seconds=%.2f",
+        )
+        profile = call_with_retry(client.profile, "CRATE PROFILE")
+        sleep_range(
+            delay_between_crate_requests_min,
+            delay_between_crate_requests_max,
+            "Sleeping between crate requests | seconds=%.2f",
+        )
+        history = call_with_retry(client.crate_history, "CRATE HISTORY")
         qe_balance = float(profile.get("qe_balance") or 0) + float(profile.get("waitlist_qe") or 0)
         opens_today = int(history.get("opens_today") or 0)
         daily_open_limit = int(history.get("daily_open_limit") or 5)
@@ -578,8 +770,13 @@ def run_wallet_crates_only(entry: WalletEntry, logger: logging.Logger) -> bool:
     opened = 0
     while True:
         try:
-            profile = client.profile()
-            history = client.crate_history()
+            profile = call_with_retry(client.profile, "CRATE PROFILE")
+            sleep_range(
+                delay_between_crate_requests_min,
+                delay_between_crate_requests_max,
+                "Sleeping between crate requests | seconds=%.2f",
+            )
+            history = call_with_retry(client.crate_history, "CRATE HISTORY")
             qe_balance = float(profile.get("qe_balance") or 0) + float(profile.get("waitlist_qe") or 0)
             opens_today = int(history.get("opens_today") or 0)
             daily_open_limit = int(history.get("daily_open_limit") or 5)
@@ -596,10 +793,16 @@ def run_wallet_crates_only(entry: WalletEntry, logger: logging.Logger) -> bool:
                 log("Sleeping before next crate open | seconds=%.2f", sleep_seconds)
                 time.sleep(sleep_seconds)
 
-            result = client.crate_open()
+            result = call_with_retry(client.crate_open, "CRATE OPEN")
             reward = result.get("reward") or {}
+            label = reward.get("label") or reward.get("amount") or reward
             reward_type = reward.get("type")
-            updated_profile = client.profile()
+            sleep_range(
+                delay_between_crate_requests_min,
+                delay_between_crate_requests_max,
+                "Sleeping between crate requests | seconds=%.2f",
+            )
+            updated_profile = call_with_retry(client.profile, "CRATE PROFILE")
             updated_qe_balance = float(updated_profile.get("qe_balance") or 0) + float(updated_profile.get("waitlist_qe") or 0)
             log(
                 "CRATE OPENED | reward_type=%s | reward=%s | qe_capped=%s | qe_balance=%s",
@@ -616,7 +819,7 @@ def run_wallet_crates_only(entry: WalletEntry, logger: logging.Logger) -> bool:
                 try:
                     dispense_result = client.poll_dispense(
                         dispense_id,
-                        timeout_seconds=int(settings["poll_timeout_seconds"]),
+                        timeout_seconds=int(settings.get("crate_poll_timeout_seconds", settings["poll_timeout_seconds"])),
                         interval_seconds=float(settings["poll_interval_seconds"]),
                     )
                     log("CRATE DACC STATUS | dispense_id=%s | result=%s", dispense_id, dispense_result)
