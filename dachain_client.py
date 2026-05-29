@@ -182,6 +182,9 @@ class DachainClient:
     def exchange_confirm_stake(self, tx_hash: str) -> dict[str, Any]:
         return self.post_json("/api/inception/exchange/confirm-stake/", {"tx_hash": tx_hash})
 
+    def sync_chain(self) -> dict[str, Any]:
+        return self.post_json("/api/inception/sync/")
+
     def poll_dispense(
         self,
         dispense_id: str,

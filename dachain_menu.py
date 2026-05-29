@@ -190,6 +190,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "delay_between_exchange_txs_min_seconds": 2,
     "delay_between_exchange_txs_max_seconds": 5,
     "exchange_gas_reserve_dacc": "0.00005",
+    "transactions_per_wallet": 1,
+    "transaction_amount_min_dacc": "0.000001",
+    "transaction_amount_max_dacc": "0.000003",
+    "delay_between_transactions_min_seconds": 2,
+    "delay_between_transactions_max_seconds": 5,
+    "transaction_gas_reserve_dacc": "0.00005",
     "cycle_proxies": True,
 }
 
@@ -709,6 +715,164 @@ def send_contract_tx(
         timeout=max(int(settings["poll_timeout_seconds"]), 120),
     )
     return tx_hash_hex, receipt, estimated_fee_wei
+
+
+def generate_external_recipient(own_addresses: set[str], used_recipients: set[str]) -> str:
+    while True:
+        recipient = Account.create(str(random.random())).address
+        recipient_key = recipient.lower()
+        if recipient_key not in own_addresses and recipient_key not in used_recipients:
+            used_recipients.add(recipient_key)
+            return recipient
+
+
+def send_native_transfer(
+    w3: Web3,
+    account: Any,
+    to_address: str,
+    amount_wei: int,
+    settings: dict[str, Any],
+) -> tuple[str, Any, int]:
+    gas_price = w3.eth.gas_price
+    gas_limit = 21_000
+    estimated_fee_wei = gas_limit * gas_price
+    balance_wei = w3.eth.get_balance(account.address)
+    if balance_wei < amount_wei + estimated_fee_wei:
+        raise RuntimeError(
+            "Insufficient DACC for transfer: "
+            f"balance={wei_to_decimal(balance_wei)} required={wei_to_decimal(amount_wei + estimated_fee_wei)}"
+        )
+    nonce = w3.eth.get_transaction_count(account.address, "pending")
+    tx = {
+        "from": account.address,
+        "to": Web3.to_checksum_address(to_address),
+        "chainId": DAC_TESTNET_CHAIN_ID,
+        "nonce": nonce,
+        "gas": gas_limit,
+        "gasPrice": gas_price,
+        "value": amount_wei,
+    }
+    signed = account.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    tx_hash_hex = normalize_tx_hash(tx_hash.hex())
+    receipt = w3.eth.wait_for_transaction_receipt(
+        tx_hash,
+        timeout=max(int(settings["poll_timeout_seconds"]), 120),
+    )
+    return tx_hash_hex, receipt, estimated_fee_wei
+
+
+def run_wallet_transactions_only(
+    entry: WalletEntry,
+    logger: logging.Logger,
+    tx_options: dict[str, Any],
+) -> bool:
+    settings = load_settings()
+    run_logger = create_run_logger(entry.index, entry.address)
+    tx_count = max(int(tx_options.get("tx_count") or settings.get("transactions_per_wallet", 1)), 1)
+    amount_min = parse_decimal(tx_options.get("amount_min", settings.get("transaction_amount_min_dacc", "0.000001")))
+    amount_max = parse_decimal(tx_options.get("amount_max", settings.get("transaction_amount_max_dacc", "0.000003")))
+    if amount_max < amount_min:
+        amount_min, amount_max = amount_max, amount_min
+    delay_min = float(settings.get("delay_between_transactions_min_seconds", 2))
+    delay_max = float(settings.get("delay_between_transactions_max_seconds", 5))
+    if delay_max < delay_min:
+        delay_min, delay_max = delay_max, delay_min
+    gas_reserve_wei = decimal_to_wei(parse_decimal(settings.get("transaction_gas_reserve_dacc", "0.00005")))
+    own_addresses = tx_options.setdefault("own_addresses", set())
+    used_recipients = tx_options.setdefault("used_recipients", set())
+
+    def log(message: str, *args: Any) -> None:
+        logger.info(message, *args)
+        run_logger.info(message, *args)
+
+    def log_error(message: str, *args: Any) -> None:
+        logger.error(message, *args)
+        run_logger.error(message, *args)
+
+    log(
+        "Wallet #%s | mode=transactions | tx_count=%s | amount=%s-%s DACC | address=%s | proxy=%s",
+        entry.index,
+        tx_count,
+        amount_min,
+        amount_max,
+        entry.address,
+        entry.proxy or "-",
+    )
+
+    client = DachainClient(
+        base_url=str(settings["base_url"]),
+        ref_code=str(settings["ref_code"]),
+        proxy=entry.proxy,
+        timeout=int(settings["request_timeout_seconds"]),
+    )
+
+    try:
+        client.authenticate_wallet(entry.address)
+    except ApiError as exc:
+        log_error("TRANSACTION AUTH ERROR | status=%s | message=%s | payload=%s", exc.status, exc, exc.payload)
+    except Exception as exc:
+        log_error("UNEXPECTED TRANSACTION AUTH ERROR | %s", exc)
+
+    try:
+        w3 = get_web3(entry, settings)
+        if not w3.is_connected():
+            log_error("TRANSACTION RPC ERROR | RPC connection failed.")
+            return False
+        account = Account.from_key(entry.private_key if entry.private_key.startswith("0x") else f"0x{entry.private_key}")
+    except Exception as exc:
+        log_error("TRANSACTION SETUP ERROR | %s", exc)
+        return False
+
+    completed = 0
+    for tx_index in range(1, tx_count + 1):
+        try:
+            balance_wei = w3.eth.get_balance(account.address)
+            spendable_wei = max(balance_wei - gas_reserve_wei, 0)
+            min_wei = decimal_to_wei(amount_min)
+            max_wei = min(decimal_to_wei(amount_max), spendable_wei)
+            if max_wei < min_wei or max_wei <= 0:
+                log(
+                    "SKIP: insufficient DACC for transfer | balance=%s DACC | reserve=%s DACC | min_amount=%s DACC",
+                    format_dacc_wei(balance_wei),
+                    format_dacc_wei(gas_reserve_wei),
+                    amount_min,
+                )
+                break
+            amount_wei = random.randint(min_wei, max_wei)
+            recipient = generate_external_recipient(own_addresses, used_recipients)
+            tx_hash, receipt, fee_wei = send_native_transfer(w3, account, recipient, amount_wei, settings)
+            log(
+                "TRANSFER SENT | tx=%s/%s | to=%s | amount=%s DACC | tx_hash=%s | fee_estimate=%s DACC",
+                tx_index,
+                tx_count,
+                recipient,
+                format_dacc_wei(amount_wei, places=9),
+                tx_hash,
+                format_dacc_wei(fee_wei, places=9),
+            )
+            if getattr(receipt, "status", 0) != 1:
+                raise RuntimeError(f"Transfer transaction reverted: {tx_hash}")
+            completed += 1
+            if tx_index < tx_count and delay_max > 0:
+                sleep_seconds = random.uniform(delay_min, delay_max)
+                log("Sleeping between transactions | seconds=%.2f", sleep_seconds)
+                time.sleep(sleep_seconds)
+        except Exception as exc:
+            log_error("TRANSFER ERROR | tx=%s/%s | %s", tx_index, tx_count, exc)
+            break
+
+    if completed > 0:
+        try:
+            sync_payload = client.sync_chain()
+            log("SYNC COMPLETED | payload=%s", sync_payload)
+        except ApiError as exc:
+            log_error("SYNC ERROR | status=%s | message=%s | payload=%s", exc.status, exc, exc.payload)
+        except Exception as exc:
+            log_error("UNEXPECTED SYNC ERROR | %s", exc)
+
+    log("TRANSACTIONS RESULT | completed=%s/%s", completed, tx_count)
+    return completed > 0
 
 
 def run_wallet(entry: WalletEntry, logger: logging.Logger) -> bool:
@@ -1401,6 +1565,11 @@ def run_all_wallets(logger: logging.Logger, mode: str, options: dict[str, Any] |
     logger.info("Starting run | version=%s | mode=%s | wallets=%s", RUNNER_VERSION, mode, len(entries))
     logger.info("Config files | keys=%s | proxies=%s | settings=%s", PRIVATE_KEYS_PATH, PROXIES_PATH, SETTINGS_PATH)
 
+    if mode == "transactions":
+        options = options or {}
+        options.setdefault("own_addresses", {entry.address.lower() for entry in entries})
+        options.setdefault("used_recipients", set())
+
     for entry in entries:
         print("-" * 72)
         if mode == "faucet":
@@ -1411,6 +1580,8 @@ def run_all_wallets(logger: logging.Logger, mode: str, options: dict[str, Any] |
             result = run_wallet_crates_only(entry, logger)
         elif mode == "exchange":
             result = run_wallet_exchange_only(entry, logger, options or {})
+        elif mode == "transactions":
+            result = run_wallet_transactions_only(entry, logger, options or {})
         else:
             raise RuntimeError(f"Unknown mode: {mode}")
         if result:
@@ -1485,6 +1656,29 @@ def prompt_exchange_options() -> dict[str, Any]:
     }
 
 
+def prompt_transaction_options() -> dict[str, Any]:
+    settings = load_settings()
+    print()
+    print("TRANSACTIONS")
+    default_count = settings.get("transactions_per_wallet", 1)
+    default_min = settings.get("transaction_amount_min_dacc", "0.000001")
+    default_max = settings.get("transaction_amount_max_dacc", "0.000003")
+    count_input = input(f"Transactions per wallet [{default_count}]: ").strip()
+    min_input = input(f"Min amount DACC [{default_min}]: ").strip()
+    max_input = input(f"Max amount DACC [{default_max}]: ").strip()
+
+    try:
+        tx_count = int(count_input or default_count)
+    except ValueError:
+        tx_count = int(default_count)
+
+    return {
+        "tx_count": max(tx_count, 1),
+        "amount_min": parse_decimal(min_input or default_min, parse_decimal(default_min, Decimal("0.000001"))),
+        "amount_max": parse_decimal(max_input or default_max, parse_decimal(default_max, Decimal("0.000003"))),
+    }
+
+
 def main() -> int:
     logger = setup_logging()
     ensure_layout()
@@ -1497,6 +1691,7 @@ def main() -> int:
         print("2. Badges")
         print("3. Crates")
         print("4. Exchange")
+        print("5. Transactions")
         print("0. Exit")
         print()
         choice = input("Select: ").strip()
@@ -1508,6 +1703,8 @@ def main() -> int:
             return run_all_wallets(logger, "crates")
         if choice == "4":
             return run_all_wallets(logger, "exchange", prompt_exchange_options())
+        if choice == "5":
+            return run_all_wallets(logger, "transactions", prompt_transaction_options())
         return 0
     except Exception as exc:
         logger.exception("FATAL ERROR | %s", exc)

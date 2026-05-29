@@ -37,5 +37,11 @@
   "delay_between_exchange_txs_min_seconds": 2,
   "delay_between_exchange_txs_max_seconds": 5,
   "exchange_gas_reserve_dacc": "0.00005",
+  "transactions_per_wallet": 1,
+  "transaction_amount_min_dacc": "0.000001",
+  "transaction_amount_max_dacc": "0.000003",
+  "delay_between_transactions_min_seconds": 2,
+  "delay_between_transactions_max_seconds": 5,
+  "transaction_gas_reserve_dacc": "0.00005",
   "cycle_proxies": true
 }

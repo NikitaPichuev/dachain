@@ -10,6 +10,7 @@ Automation tool for DACHAIN Inception testnet.
 - Rank NFT minting
 - Quantum crate opening
 - QE Pool exchange: burn, stake, withdraw, claim pending fees
+- Native DACC transactions to unique external addresses
 - Proxy support
 - Per-wallet logs
 
@@ -28,6 +29,7 @@ Automation tool for DACHAIN Inception testnet.
 2. Badges
 3. Crates
 4. Exchange
+5. Transactions
 0. Exit
 ```
 
@@ -64,6 +66,12 @@ The Exchange menu supports:
 
 Burn, stake, and withdraw use configurable min/max percentages and transaction count.
 Claim pending fees runs one claim transaction per wallet when fees are available.
+
+## Transactions
+
+The Transactions menu sends small native DACC transfers to freshly generated unique
+external addresses. Recipients are checked against loaded wallet addresses and are
+not reused during the same run.
 
 ## Settings
 
