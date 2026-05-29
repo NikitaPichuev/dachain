@@ -191,8 +191,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "delay_between_exchange_txs_max_seconds": 5,
     "exchange_gas_reserve_dacc": "0.00005",
     "transactions_per_wallet": 1,
-    "transaction_amount_min_dacc": "0.000001",
-    "transaction_amount_max_dacc": "0.000003",
+    "transaction_amount_min_dacc": "0.000000000000000001",
+    "transaction_amount_max_dacc": "0.000000000000000003",
     "delay_between_transactions_min_seconds": 2,
     "delay_between_transactions_max_seconds": 5,
     "transaction_gas_reserve_dacc": "0.00005",
@@ -770,8 +770,8 @@ def run_wallet_transactions_only(
     settings = load_settings()
     run_logger = create_run_logger(entry.index, entry.address)
     tx_count = max(int(tx_options.get("tx_count") or settings.get("transactions_per_wallet", 1)), 1)
-    amount_min = parse_decimal(tx_options.get("amount_min", settings.get("transaction_amount_min_dacc", "0.000001")))
-    amount_max = parse_decimal(tx_options.get("amount_max", settings.get("transaction_amount_max_dacc", "0.000003")))
+    amount_min = parse_decimal(tx_options.get("amount_min", settings.get("transaction_amount_min_dacc", "0.000000000000000001")))
+    amount_max = parse_decimal(tx_options.get("amount_max", settings.get("transaction_amount_max_dacc", "0.000000000000000003")))
     if amount_max < amount_min:
         amount_min, amount_max = amount_max, amount_min
     delay_min = float(settings.get("delay_between_transactions_min_seconds", 2))
@@ -1661,8 +1661,8 @@ def prompt_transaction_options() -> dict[str, Any]:
     print()
     print("TRANSACTIONS")
     default_count = settings.get("transactions_per_wallet", 1)
-    default_min = settings.get("transaction_amount_min_dacc", "0.000001")
-    default_max = settings.get("transaction_amount_max_dacc", "0.000003")
+    default_min = settings.get("transaction_amount_min_dacc", "0.000000000000000001")
+    default_max = settings.get("transaction_amount_max_dacc", "0.000000000000000003")
     count_input = input(f"Transactions per wallet [{default_count}]: ").strip()
     min_input = input(f"Min amount DACC [{default_min}]: ").strip()
     max_input = input(f"Max amount DACC [{default_max}]: ").strip()
@@ -1674,8 +1674,8 @@ def prompt_transaction_options() -> dict[str, Any]:
 
     return {
         "tx_count": max(tx_count, 1),
-        "amount_min": parse_decimal(min_input or default_min, parse_decimal(default_min, Decimal("0.000001"))),
-        "amount_max": parse_decimal(max_input or default_max, parse_decimal(default_max, Decimal("0.000003"))),
+        "amount_min": parse_decimal(min_input or default_min, parse_decimal(default_min, Decimal("0.000000000000000001"))),
+        "amount_max": parse_decimal(max_input or default_max, parse_decimal(default_max, Decimal("0.000000000000000003"))),
     }
 
 
