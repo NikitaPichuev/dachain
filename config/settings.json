@@ -43,5 +43,7 @@
   "delay_between_transactions_min_seconds": 2,
   "delay_between_transactions_max_seconds": 5,
   "transaction_gas_reserve_dacc": "0.00005",
+  "rpc_proxy_fallback_enabled": true,
+  "rpc_proxy_probe_limit": 0,
   "cycle_proxies": true
 }

@@ -196,6 +196,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "delay_between_transactions_min_seconds": 2,
     "delay_between_transactions_max_seconds": 5,
     "transaction_gas_reserve_dacc": "0.00005",
+    "rpc_proxy_fallback_enabled": True,
+    "rpc_proxy_probe_limit": 0,
     "cycle_proxies": True,
 }
 
@@ -339,6 +341,68 @@ def get_web3(entry: WalletEntry, settings: dict[str, Any]) -> Web3:
         request_kwargs["proxies"] = {"http": entry.proxy, "https": entry.proxy}
     provider = Web3.HTTPProvider(DAC_TESTNET_RPC_URL, request_kwargs=request_kwargs)
     return Web3(provider)
+
+
+def get_web3_for_proxy(settings: dict[str, Any], proxy: str | None) -> Web3:
+    request_kwargs: dict[str, Any] = {"timeout": int(settings["request_timeout_seconds"])}
+    if proxy and bool(settings.get("use_proxy_for_rpc", False)):
+        request_kwargs["proxies"] = {"http": proxy, "https": proxy}
+    provider = Web3.HTTPProvider(DAC_TESTNET_RPC_URL, request_kwargs=request_kwargs)
+    return Web3(provider)
+
+
+def rpc_proxy_candidates(entry: WalletEntry, settings: dict[str, Any]) -> list[str | None]:
+    if not bool(settings.get("use_proxy_for_rpc", False)):
+        return [None]
+
+    candidates: list[str | None] = []
+    seen: set[str] = set()
+    if entry.proxy:
+        candidates.append(entry.proxy)
+        seen.add(entry.proxy)
+
+    if bool(settings.get("rpc_proxy_fallback_enabled", True)):
+        for raw_proxy in load_lines(PROXIES_PATH):
+            try:
+                proxy = normalize_proxy(raw_proxy)
+            except Exception:
+                continue
+            if proxy and proxy not in seen:
+                candidates.append(proxy)
+                seen.add(proxy)
+
+    probe_limit = int(settings.get("rpc_proxy_probe_limit", 0) or 0)
+    if probe_limit > 0:
+        return candidates[:probe_limit]
+    return candidates
+
+
+def get_connected_web3(
+    entry: WalletEntry,
+    settings: dict[str, Any],
+    log: Any,
+    log_error: Any,
+    context: str,
+) -> tuple[Web3 | None, str | None]:
+    candidates = rpc_proxy_candidates(entry, settings)
+    if not candidates:
+        log_error("%s RPC ERROR | no proxy candidates available", context)
+        return None, None
+
+    for attempt, proxy in enumerate(candidates, start=1):
+        try:
+            w3 = get_web3_for_proxy(settings, proxy)
+            chain_id = int(w3.eth.chain_id)
+            if chain_id != DAC_TESTNET_CHAIN_ID:
+                log_error("%s RPC ERROR | attempt=%s/%s | proxy=%s | wrong_chain_id=%s", context, attempt, len(candidates), proxy or "-", chain_id)
+                continue
+            if proxy != entry.proxy:
+                log("%s RPC proxy fallback OK | proxy=%s", context, proxy or "-")
+            return w3, proxy
+        except Exception as exc:
+            log_error("%s RPC CONNECT ERROR | attempt=%s/%s | proxy=%s | %s", context, attempt, len(candidates), proxy or "-", exc)
+
+    return None, None
 
 
 def normalize_tx_hash(tx_hash: Any) -> str:
@@ -545,9 +609,8 @@ def mint_rank_badges(
         return True, profile, False
 
     try:
-        w3 = get_web3(entry, settings)
-        if not w3.is_connected():
-            log_error("RANK MINT ERROR | RPC connection failed.")
+        w3, rpc_proxy = get_connected_web3(entry, settings, log, log_error, "RANK MINT")
+        if not w3:
             return False, profile, True
         contract = w3.eth.contract(
             address=Web3.to_checksum_address(RANK_BADGE_CONTRACT),
@@ -557,8 +620,9 @@ def mint_rank_badges(
         onchain_balance_wei = w3.eth.get_balance(account.address)
         onchain_balance = onchain_balance_wei / 10**18
         log(
-            "RPC OK | address=%s | onchain_dacc_balance=%.18f | profile_dacc_balance=%s",
+            "RPC OK | address=%s | rpc_proxy=%s | onchain_dacc_balance=%.18f | profile_dacc_balance=%s",
             account.address,
+            rpc_proxy or "-",
             onchain_balance,
             profile.get("dacc_balance"),
         )
@@ -815,10 +879,10 @@ def run_wallet_transactions_only(
         log_error("UNEXPECTED TRANSACTION AUTH ERROR | %s", exc)
 
     try:
-        w3 = get_web3(entry, settings)
-        if not w3.is_connected():
-            log_error("TRANSACTION RPC ERROR | RPC connection failed.")
+        w3, rpc_proxy = get_connected_web3(entry, settings, log, log_error, "TRANSACTION")
+        if not w3:
             return False
+        log("TRANSACTION RPC OK | proxy=%s", rpc_proxy or "-")
         account = Account.from_key(entry.private_key if entry.private_key.startswith("0x") else f"0x{entry.private_key}")
     except Exception as exc:
         log_error("TRANSACTION SETUP ERROR | %s", exc)
@@ -1228,10 +1292,10 @@ def run_wallet_exchange_only(
         return False
 
     try:
-        w3 = get_web3(entry, settings)
-        if not w3.is_connected():
-            log_error("EXCHANGE RPC ERROR | RPC connection failed.")
+        w3, rpc_proxy = get_connected_web3(entry, settings, log, log_error, "EXCHANGE")
+        if not w3:
             return False
+        log("EXCHANGE RPC OK | proxy=%s", rpc_proxy or "-")
         account = Account.from_key(entry.private_key if entry.private_key.startswith("0x") else f"0x{entry.private_key}")
         contract = w3.eth.contract(address=Web3.to_checksum_address(QE_POOL_CONTRACT), abi=QE_POOL_ABI)
     except Exception as exc:
