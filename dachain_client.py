@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import requests
 from eth_account import Account
@@ -48,11 +48,19 @@ def normalize_proxy(proxy: str | None) -> str | None:
     if "://" not in value:
         value = f"http://{value}"
 
+    split = urlsplit(value)
+    if "@" in split.netloc:
+        left, right = split.netloc.rsplit("@", 1)
+        left_host, separator, left_port = left.rpartition(":")
+        # Legacy format: host:port@login:password. Convert it to login:password@host:port.
+        if left_host and separator and left_port.isdigit() and ":" in right:
+            value = urlunsplit((split.scheme, f"{right}@{left_host}:{left_port}", split.path, split.query, split.fragment))
+
     parsed = urlparse(value)
     if not parsed.scheme or not parsed.hostname:
         raise ValueError(
             "Proxy format is invalid. Expected host:port, login:password@host:port, "
-            "or full URL with scheme."
+            "host:port@login:password, or full URL with scheme."
         )
 
     return value
@@ -98,7 +106,7 @@ class DachainClient:
             headers={"Accept": "application/json"},
             timeout=self.timeout,
         )
-        response.raise_for_status()
+        self._decode_json(response)
         if not self._csrf_token():
             raise ApiError("CSRF bootstrap succeeded but csrftoken cookie is missing.")
 
@@ -147,6 +155,9 @@ class DachainClient:
     def claim_badge(self) -> dict[str, Any]:
         return self.post_json("/api/inception/claim-badge/")
 
+    def claim_flash_badge(self) -> dict[str, Any]:
+        return self.post_json("/api/inception/flash-badge/claim/")
+
     def claim_faucet(self) -> dict[str, Any]:
         return self.post_json("/api/inception/faucet/")
 
@@ -164,6 +175,12 @@ class DachainClient:
 
     def nft_confirm_mint(self, rank_key: str, tx_hash: str) -> dict[str, Any]:
         return self.post_json("/api/inception/nft/confirm-mint/", {"rank_key": rank_key, "tx_hash": tx_hash})
+
+    def exchange_confirm_burn(self, tx_hash: str) -> dict[str, Any]:
+        return self.post_json("/api/inception/exchange/confirm-burn/", {"tx_hash": tx_hash})
+
+    def exchange_confirm_stake(self, tx_hash: str) -> dict[str, Any]:
+        return self.post_json("/api/inception/exchange/confirm-stake/", {"tx_hash": tx_hash})
 
     def poll_dispense(
         self,

@@ -9,6 +9,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from itertools import cycle
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,102 @@ RANK_BADGE_ABI: list[dict[str, Any]] = [
     },
 ]
 CRATE_QE_COST = 150
+QE_POOL_CONTRACT = "0x3691A78bE270dB1f3b1a86177A8f23F89A8Cef24"
+QE_PER_DACC = 1000
+QE_POOL_ABI: list[dict[str, Any]] = [
+    {"name": "burnForQE", "type": "function", "stateMutability": "payable", "inputs": [], "outputs": []},
+    {"name": "stake", "type": "function", "stateMutability": "payable", "inputs": [], "outputs": []},
+    {
+        "name": "unstake",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [{"name": "amount", "type": "uint256"}],
+        "outputs": [],
+    },
+    {"name": "claimFees", "type": "function", "stateMutability": "nonpayable", "inputs": [], "outputs": []},
+    {
+        "name": "pendingFees",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "user", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
+        "name": "lps",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "", "type": "address"}],
+        "outputs": [
+            {"name": "staked", "type": "uint256"},
+            {"name": "rewardDebt", "type": "uint256"},
+        ],
+    },
+    {"name": "totalStaked", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"name": "", "type": "uint256"}]},
+    {"name": "totalBurned", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"name": "", "type": "uint256"}]},
+    {"name": "burnBps", "type": "function", "stateMutability": "view", "inputs": [], "outputs": [{"name": "", "type": "uint16"}]},
+]
+MINTAURA_NATIVE_TOKEN = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+MINTAURA_NFTS: list[dict[str, Any]] = [
+    {
+        "name": "Inception",
+        "contract": "0xcB98FA54D3dEa40795924112215A34004D078C10",
+        "price_wei": "100000000000000000",
+    },
+    {
+        "name": "Prism",
+        "contract": "0xE644b94357466E6f45Cb27382608C6C4A3410Caa",
+        "price_wei": "100000000000000000",
+    },
+    {
+        "name": "Evie",
+        "contract": "0xD2eb0557A0541ff66A86A41a8A966cbb6e38E234",
+        "price_wei": "100000000000000000",
+    },
+    {
+        "name": "Nyxia",
+        "contract": "0x7CDD0E631372747764b70b9d97948932c1eBC706",
+        "price_wei": "0",
+    },
+]
+MINTAURA_ERC721_DROP_ABI: list[dict[str, Any]] = [
+    {
+        "name": "claim",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "_receiver", "type": "address"},
+            {"name": "_quantity", "type": "uint256"},
+            {"name": "_currency", "type": "address"},
+            {"name": "_pricePerToken", "type": "uint256"},
+            {
+                "name": "_allowlistProof",
+                "type": "tuple",
+                "components": [
+                    {"name": "proof", "type": "bytes32[]"},
+                    {"name": "quantityLimitPerWallet", "type": "uint256"},
+                    {"name": "pricePerToken", "type": "uint256"},
+                    {"name": "currency", "type": "address"},
+                ],
+            },
+            {"name": "_data", "type": "bytes"},
+        ],
+        "outputs": [],
+    },
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "owner", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
+        "name": "totalMinted",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+]
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -69,6 +166,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "use_proxy_for_rpc": True,
     "delay_between_faucet_requests_min_seconds": 2,
     "delay_between_faucet_requests_max_seconds": 5,
+    "faucet_auth_retry_count": 5,
+    "faucet_auth_retry_delay_min_seconds": 20,
+    "faucet_auth_retry_delay_max_seconds": 40,
     "faucet_busy_retry_count": 2,
     "faucet_busy_retry_delay_min_seconds": 20,
     "faucet_busy_retry_delay_max_seconds": 35,
@@ -76,9 +176,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "delay_between_crates_max_seconds": 3,
     "delay_between_crate_requests_min_seconds": 1,
     "delay_between_crate_requests_max_seconds": 2,
-    "crate_retry_count": 2,
-    "crate_retry_backoff_min_seconds": 4,
-    "crate_retry_backoff_max_seconds": 8,
+    "crate_retry_count": 5,
+    "crate_retry_backoff_min_seconds": 20,
+    "crate_retry_backoff_max_seconds": 40,
+    "crate_poll_dacc_status": False,
+    "delay_between_mintaura_mints_min_seconds": 2,
+    "delay_between_mintaura_mints_max_seconds": 5,
+    "mintaura_allow_paid": False,
+    "exchange_operation": "burn",
+    "exchange_percent_min": 5,
+    "exchange_percent_max": 10,
+    "exchange_transactions_count": 1,
+    "delay_between_exchange_txs_min_seconds": 2,
+    "delay_between_exchange_txs_max_seconds": 5,
+    "exchange_gas_reserve_dacc": "0.00005",
     "cycle_proxies": True,
 }
 
@@ -162,6 +273,10 @@ def load_lines(path: Path) -> list[str]:
     return values
 
 
+def is_retryable_api_error(exc: ApiError) -> bool:
+    return exc.status in {500, 502, 503, 504}
+
+
 def build_wallet_entries(logger: logging.Logger) -> list[WalletEntry]:
     private_keys = load_lines(PRIVATE_KEYS_PATH)
     proxies = load_lines(PROXIES_PATH)
@@ -227,6 +342,48 @@ def normalize_tx_hash(tx_hash: Any) -> str:
     return value
 
 
+def parse_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    try:
+        return Decimal(str(value).strip())
+    except (InvalidOperation, AttributeError):
+        return default
+
+
+def decimal_to_wei(value: Decimal) -> int:
+    if value <= 0:
+        return 0
+    return int((value * Decimal(10**18)).to_integral_value(rounding=ROUND_DOWN))
+
+
+def wei_to_decimal(value: int) -> Decimal:
+    return Decimal(int(value)) / Decimal(10**18)
+
+
+def format_dacc_wei(value: int, places: int = 6) -> str:
+    quant = Decimal(1).scaleb(-places)
+    return str(wei_to_decimal(value).quantize(quant, rounding=ROUND_DOWN).normalize())
+
+
+def normalize_percent_range(min_percent: Any, max_percent: Any) -> tuple[Decimal, Decimal]:
+    percent_min = max(parse_decimal(min_percent), Decimal("0"))
+    percent_max = max(parse_decimal(max_percent), Decimal("0"))
+    if percent_max < percent_min:
+        percent_min, percent_max = percent_max, percent_min
+    return min(percent_min, Decimal("100")), min(percent_max, Decimal("100"))
+
+
+def random_percent_wei(base_wei: int, percent_min: Decimal, percent_max: Decimal) -> tuple[int, Decimal]:
+    if base_wei <= 0 or percent_max <= 0:
+        return 0, Decimal("0")
+    chosen = Decimal(str(random.uniform(float(percent_min), float(percent_max))))
+    amount_wei = int((Decimal(base_wei) * chosen / Decimal("100")).to_integral_value(rounding=ROUND_DOWN))
+    return amount_wei, chosen
+
+
 def find_last_rank_tx_hash(address: str, rank_key: str) -> str | None:
     if not APP_LOG_PATH.exists():
         return None
@@ -268,6 +425,93 @@ def claim_early_badge(
         return profile
     except Exception as exc:
         log_error("UNEXPECTED EARLY BADGE ERROR | %s", exc)
+        return profile
+
+
+def badge_keys(profile: dict[str, Any]) -> set[str]:
+    return {str(badge.get("badge__key", "")) for badge in profile.get("badges", [])}
+
+
+def is_no_claimable_badge_error(exc: ApiError) -> bool:
+    message = f"{exc} {exc.payload}".lower()
+    if exc.status not in {400, 404, 409}:
+        return False
+    markers = (
+        "already",
+        "not available",
+        "no badge",
+        "no claim",
+        "nothing",
+        "window",
+        "cooldown",
+        "not eligible",
+    )
+    return any(marker in message for marker in markers)
+
+
+def claim_available_badge(
+    client: DachainClient,
+    profile: dict[str, Any],
+    log: Any,
+    log_error: Any,
+) -> dict[str, Any]:
+    if profile.get("early_badge_claimed"):
+        log("Early badge already claimed; checking other claimable badges.")
+
+    before_keys = badge_keys(profile)
+
+    try:
+        payload = client.claim_badge()
+        log("Badge claim requested | payload=%s", payload)
+        updated_profile = client.profile()
+        new_badges = sorted(badge_keys(updated_profile) - before_keys)
+        if new_badges:
+            log("Badge claimed | new_badges=%s", new_badges)
+        else:
+            log("Badge claim completed | no new badge keys detected")
+        return updated_profile
+    except ApiError as exc:
+        if is_no_claimable_badge_error(exc):
+            log("SKIP: no claimable badge | status=%s | message=%s | payload=%s", exc.status, exc, exc.payload)
+            return profile
+        log_error("BADGE CLAIM ERROR | status=%s | message=%s | payload=%s", exc.status, exc, exc.payload)
+        return profile
+    except Exception as exc:
+        log_error("UNEXPECTED BADGE CLAIM ERROR | %s", exc)
+        return profile
+
+
+def claim_flash_badge(
+    client: DachainClient,
+    profile: dict[str, Any],
+    log: Any,
+    log_error: Any,
+) -> dict[str, Any]:
+    flash_badge = profile.get("flash_badge") or {}
+    state = str(flash_badge.get("state") or "").strip().lower()
+    if state and state != "live":
+        log("SKIP: flash badge not live | state=%s", state)
+        return profile
+
+    try:
+        payload = client.claim_flash_badge()
+        updated_flash_badge = payload.get("flash_badge") or {}
+        log(
+            "FLASH BADGE CLAIMED | state=%s | multiplier=%s | multiplier_expires_at=%s | payload=%s",
+            updated_flash_badge.get("state"),
+            updated_flash_badge.get("multiplier"),
+            updated_flash_badge.get("multiplier_expires_at"),
+            payload,
+        )
+        return client.profile()
+    except ApiError as exc:
+        if is_no_claimable_badge_error(exc):
+            log("SKIP: no claimable flash badge | status=%s | message=%s | payload=%s", exc.status, exc, exc.payload)
+            return profile
+        log_error("FLASH BADGE CLAIM ERROR | status=%s | message=%s | payload=%s", exc.status, exc, exc.payload)
+        return profile
+    except Exception as exc:
+        log_error("UNEXPECTED FLASH BADGE CLAIM ERROR | %s", exc)
         return profile
 
 
@@ -424,6 +668,49 @@ def mint_rank_badges(
     return all_ok, current_profile, True
 
 
+def send_contract_tx(
+    w3: Web3,
+    account: Any,
+    function: Any,
+    settings: dict[str, Any],
+    *,
+    value_wei: int = 0,
+) -> tuple[str, Any, int]:
+    gas_price = w3.eth.gas_price
+    tx_base = {
+        "from": account.address,
+        "value": value_wei,
+    }
+    gas_estimate = function.estimate_gas(tx_base)
+    gas_limit = int(gas_estimate * 1.2) + 5000
+    estimated_fee_wei = gas_limit * gas_price
+    balance_wei = w3.eth.get_balance(account.address)
+    if balance_wei < value_wei + estimated_fee_wei:
+        raise RuntimeError(
+            "Insufficient DACC for tx: "
+            f"balance={wei_to_decimal(balance_wei)} required={wei_to_decimal(value_wei + estimated_fee_wei)}"
+        )
+    nonce = w3.eth.get_transaction_count(account.address, "pending")
+    tx = function.build_transaction(
+        {
+            "from": account.address,
+            "chainId": DAC_TESTNET_CHAIN_ID,
+            "nonce": nonce,
+            "gas": gas_limit,
+            "gasPrice": gas_price,
+            "value": value_wei,
+        }
+    )
+    signed = account.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    tx_hash_hex = normalize_tx_hash(tx_hash.hex())
+    receipt = w3.eth.wait_for_transaction_receipt(
+        tx_hash,
+        timeout=max(int(settings["poll_timeout_seconds"]), 120),
+    )
+    return tx_hash_hex, receipt, estimated_fee_wei
+
+
 def run_wallet(entry: WalletEntry, logger: logging.Logger) -> bool:
     settings = load_settings()
     run_logger = create_run_logger(entry.index, entry.address)
@@ -510,6 +797,9 @@ def run_wallet_faucet_only(entry: WalletEntry, logger: logging.Logger) -> bool:
     faucet_busy_retry_count = max(int(settings.get("faucet_busy_retry_count", 2)), 0)
     faucet_busy_retry_delay_min = float(settings.get("faucet_busy_retry_delay_min_seconds", 20))
     faucet_busy_retry_delay_max = float(settings.get("faucet_busy_retry_delay_max_seconds", 35))
+    faucet_auth_retry_count = max(int(settings.get("faucet_auth_retry_count", 5)), 0)
+    faucet_auth_retry_delay_min = float(settings.get("faucet_auth_retry_delay_min_seconds", 20))
+    faucet_auth_retry_delay_max = float(settings.get("faucet_auth_retry_delay_max_seconds", 40))
     if delay_between_faucet_requests_max < delay_between_faucet_requests_min:
         delay_between_faucet_requests_min, delay_between_faucet_requests_max = (
             delay_between_faucet_requests_max,
@@ -519,6 +809,11 @@ def run_wallet_faucet_only(entry: WalletEntry, logger: logging.Logger) -> bool:
         faucet_busy_retry_delay_min, faucet_busy_retry_delay_max = (
             faucet_busy_retry_delay_max,
             faucet_busy_retry_delay_min,
+        )
+    if faucet_auth_retry_delay_max < faucet_auth_retry_delay_min:
+        faucet_auth_retry_delay_min, faucet_auth_retry_delay_max = (
+            faucet_auth_retry_delay_max,
+            faucet_auth_retry_delay_min,
         )
 
     def log(message: str, *args: Any) -> None:
@@ -536,6 +831,39 @@ def run_wallet_faucet_only(entry: WalletEntry, logger: logging.Logger) -> bool:
         log(message, sleep_seconds)
         time.sleep(sleep_seconds)
 
+    def auth_call_with_retry(callback: Any, action_name: str) -> Any:
+        attempt = 0
+        while True:
+            try:
+                return callback()
+            except ApiError as exc:
+                attempt += 1
+                if not is_retryable_api_error(exc) or attempt > faucet_auth_retry_count:
+                    raise
+                log_error(
+                    "%s TEMP SERVER ERROR | attempt=%s/%s | status=%s | message=%s",
+                    action_name,
+                    attempt,
+                    faucet_auth_retry_count,
+                    exc.status,
+                    exc,
+                )
+                sleep_range(
+                    faucet_auth_retry_delay_min,
+                    faucet_auth_retry_delay_max,
+                    f"Sleeping before retrying {action_name} | seconds=%.2f",
+                )
+            except Exception as exc:
+                attempt += 1
+                if attempt > faucet_auth_retry_count:
+                    raise
+                log_error("%s NETWORK ERROR | attempt=%s/%s | %s", action_name, attempt, faucet_auth_retry_count, exc)
+                sleep_range(
+                    faucet_auth_retry_delay_min,
+                    faucet_auth_retry_delay_max,
+                    f"Sleeping before retrying {action_name} | seconds=%.2f",
+                )
+
     log("Wallet #%s | mode=faucet | address=%s | proxy=%s", entry.index, entry.address, entry.proxy or "-")
 
     client = DachainClient(
@@ -546,13 +874,13 @@ def run_wallet_faucet_only(entry: WalletEntry, logger: logging.Logger) -> bool:
     )
 
     try:
-        auth = client.authenticate_wallet(entry.address)
+        auth = auth_call_with_retry(lambda: client.authenticate_wallet(entry.address), "AUTH")
         sleep_range(
             delay_between_faucet_requests_min,
             delay_between_faucet_requests_max,
             "Sleeping between faucet requests | seconds=%.2f",
         )
-        profile = client.profile()
+        profile = auth_call_with_retry(client.profile, "PROFILE")
         log("Auth OK | created=%s | qe_balance=%s | dacc_balance=%s", auth.created, profile.get("qe_balance"), profile.get("dacc_balance"))
         log(
             "Profile | faucet_available=%s | faucet_seconds_left=%s | x_linked=%s | discord_linked=%s",
@@ -639,17 +967,18 @@ def run_wallet_badges_only(entry: WalletEntry, logger: logging.Logger) -> bool:
         log_error("UNEXPECTED AUTH ERROR | %s", exc)
         return False
 
-    before_keys = {str(badge.get("badge__key", "")) for badge in profile.get("badges", [])}
+    before_keys = badge_keys(profile)
     before_unminted_ranks = {
         str(badge.get("badge__key", ""))
         for badge in profile.get("badges", [])
         if str(badge.get("badge__key", "")).startswith("rank_") and not badge.get("nft_tx_hash")
     }
 
-    profile = claim_early_badge(client, profile, log, log_error)
+    profile = claim_flash_badge(client, profile, log, log_error)
+    profile = claim_available_badge(client, profile, log, log_error)
     rank_ok, profile, rank_attempted = mint_rank_badges(client, entry, profile, settings, log, log_error)
 
-    after_keys = {str(badge.get("badge__key", "")) for badge in profile.get("badges", [])}
+    after_keys = badge_keys(profile)
     after_unminted_ranks = {
         str(badge.get("badge__key", ""))
         for badge in profile.get("badges", [])
@@ -669,6 +998,206 @@ def run_wallet_badges_only(entry: WalletEntry, logger: logging.Logger) -> bool:
         badge_ok,
     )
     return badge_ok
+
+
+def run_wallet_exchange_only(
+    entry: WalletEntry,
+    logger: logging.Logger,
+    exchange_options: dict[str, Any],
+) -> bool:
+    settings = load_settings()
+    run_logger = create_run_logger(entry.index, entry.address)
+    operation = str(exchange_options.get("operation") or settings.get("exchange_operation", "burn")).strip().lower()
+    tx_count = max(int(exchange_options.get("tx_count") or settings.get("exchange_transactions_count", 1)), 1)
+    percent_min, percent_max = normalize_percent_range(
+        exchange_options.get("percent_min", settings.get("exchange_percent_min", 5)),
+        exchange_options.get("percent_max", settings.get("exchange_percent_max", 10)),
+    )
+    delay_min = float(settings.get("delay_between_exchange_txs_min_seconds", 2))
+    delay_max = float(settings.get("delay_between_exchange_txs_max_seconds", 5))
+    if delay_max < delay_min:
+        delay_min, delay_max = delay_max, delay_min
+    gas_reserve_wei = decimal_to_wei(parse_decimal(settings.get("exchange_gas_reserve_dacc", "0.00005")))
+
+    def log(message: str, *args: Any) -> None:
+        logger.info(message, *args)
+        run_logger.info(message, *args)
+
+    def log_error(message: str, *args: Any) -> None:
+        logger.error(message, *args)
+        run_logger.error(message, *args)
+
+    def sleep_between_exchange_txs(tx_index: int) -> None:
+        if tx_index >= tx_count or delay_max <= 0:
+            return
+        sleep_seconds = random.uniform(delay_min, delay_max)
+        log("Sleeping between exchange txs | seconds=%.2f", sleep_seconds)
+        time.sleep(sleep_seconds)
+
+    log(
+        "Wallet #%s | mode=exchange | operation=%s | percent=%s-%s | tx_count=%s | address=%s | proxy=%s",
+        entry.index,
+        operation,
+        percent_min,
+        percent_max,
+        tx_count,
+        entry.address,
+        entry.proxy or "-",
+    )
+
+    client = DachainClient(
+        base_url=str(settings["base_url"]),
+        ref_code=str(settings["ref_code"]),
+        proxy=entry.proxy,
+        timeout=int(settings["request_timeout_seconds"]),
+    )
+
+    try:
+        auth = client.authenticate_wallet(entry.address)
+        profile = client.profile()
+        log("Auth OK | created=%s | qe_balance=%s | dacc_balance=%s", auth.created, profile.get("qe_balance"), profile.get("dacc_balance"))
+    except ApiError as exc:
+        log_error("EXCHANGE AUTH ERROR | status=%s | message=%s | payload=%s", exc.status, exc, exc.payload)
+        return False
+    except Exception as exc:
+        log_error("UNEXPECTED EXCHANGE AUTH ERROR | %s", exc)
+        return False
+
+    try:
+        w3 = get_web3(entry, settings)
+        if not w3.is_connected():
+            log_error("EXCHANGE RPC ERROR | RPC connection failed.")
+            return False
+        account = Account.from_key(entry.private_key if entry.private_key.startswith("0x") else f"0x{entry.private_key}")
+        contract = w3.eth.contract(address=Web3.to_checksum_address(QE_POOL_CONTRACT), abi=QE_POOL_ABI)
+    except Exception as exc:
+        log_error("EXCHANGE SETUP ERROR | %s", exc)
+        return False
+
+    completed = 0
+    for tx_index in range(1, tx_count + 1):
+        try:
+            balance_wei = w3.eth.get_balance(account.address)
+            lp_position = contract.functions.lps(account.address).call()
+            staked_wei = int(lp_position[0] if isinstance(lp_position, (list, tuple)) else getattr(lp_position, "staked", 0))
+            pending_fees_wei = int(contract.functions.pendingFees(account.address).call())
+            total_staked_wei = int(contract.functions.totalStaked().call())
+            total_burned_wei = int(contract.functions.totalBurned().call())
+            burn_bps = int(contract.functions.burnBps().call())
+
+            log(
+                "Exchange status | tx=%s/%s | balance=%s DACC | staked=%s DACC | pending_fees=%s DACC | total_staked=%s DACC | total_burned=%s DACC | burn_bps=%s",
+                tx_index,
+                tx_count,
+                format_dacc_wei(balance_wei),
+                format_dacc_wei(staked_wei),
+                format_dacc_wei(pending_fees_wei),
+                format_dacc_wei(total_staked_wei),
+                format_dacc_wei(total_burned_wei),
+                burn_bps,
+            )
+
+            if operation == "burn":
+                spendable_wei = max(balance_wei - gas_reserve_wei, 0)
+                amount_wei, chosen_percent = random_percent_wei(spendable_wei, percent_min, percent_max)
+                if amount_wei <= 0:
+                    log("SKIP: insufficient DACC for burn | balance=%s DACC", format_dacc_wei(balance_wei))
+                    break
+                function = contract.functions.burnForQE()
+                tx_hash, receipt, fee_wei = send_contract_tx(w3, account, function, settings, value_wei=amount_wei)
+                log(
+                    "BURN SENT | amount=%s DACC | percent=%.4f | tx_hash=%s | fee_estimate=%s DACC",
+                    format_dacc_wei(amount_wei),
+                    float(chosen_percent),
+                    tx_hash,
+                    format_dacc_wei(fee_wei),
+                )
+                if getattr(receipt, "status", 0) != 1:
+                    raise RuntimeError(f"Burn transaction reverted: {tx_hash}")
+                confirm = client.exchange_confirm_burn(tx_hash)
+                log(
+                    "BURN CONFIRMED | tx_hash=%s | qe_credited=%s | payload=%s",
+                    tx_hash,
+                    confirm.get("qe_credited", int(wei_to_decimal(amount_wei) * QE_PER_DACC)),
+                    confirm,
+                )
+
+            elif operation in {"deposit", "stake"}:
+                spendable_wei = max(balance_wei - gas_reserve_wei, 0)
+                amount_wei, chosen_percent = random_percent_wei(spendable_wei, percent_min, percent_max)
+                if amount_wei <= 0:
+                    log("SKIP: insufficient DACC for deposit | balance=%s DACC", format_dacc_wei(balance_wei))
+                    break
+                function = contract.functions.stake()
+                tx_hash, receipt, fee_wei = send_contract_tx(w3, account, function, settings, value_wei=amount_wei)
+                log(
+                    "DEPOSIT SENT | amount=%s DACC | percent=%.4f | tx_hash=%s | fee_estimate=%s DACC",
+                    format_dacc_wei(amount_wei),
+                    float(chosen_percent),
+                    tx_hash,
+                    format_dacc_wei(fee_wei),
+                )
+                if getattr(receipt, "status", 0) != 1:
+                    raise RuntimeError(f"Deposit transaction reverted: {tx_hash}")
+                try:
+                    confirm = client.exchange_confirm_stake(tx_hash)
+                    log("DEPOSIT CONFIRMED | tx_hash=%s | payload=%s", tx_hash, confirm)
+                except ApiError as exc:
+                    log_error("DEPOSIT CONFIRM API ERROR | tx_hash=%s | status=%s | message=%s | payload=%s", tx_hash, exc.status, exc, exc.payload)
+
+            elif operation in {"withdraw", "unstake"}:
+                amount_wei, chosen_percent = random_percent_wei(staked_wei, percent_min, percent_max)
+                if amount_wei <= 0:
+                    log("SKIP: no staked DACC for withdraw | staked=%s DACC", format_dacc_wei(staked_wei))
+                    break
+                function = contract.functions.unstake(amount_wei)
+                tx_hash, receipt, fee_wei = send_contract_tx(w3, account, function, settings)
+                log(
+                    "WITHDRAW SENT | amount=%s DACC | percent=%.4f | tx_hash=%s | fee_estimate=%s DACC",
+                    format_dacc_wei(amount_wei),
+                    float(chosen_percent),
+                    tx_hash,
+                    format_dacc_wei(fee_wei),
+                )
+                if getattr(receipt, "status", 0) != 1:
+                    raise RuntimeError(f"Withdraw transaction reverted: {tx_hash}")
+                log("WITHDRAW CONFIRMED | tx_hash=%s", tx_hash)
+
+            elif operation == "claim":
+                if pending_fees_wei <= 0:
+                    log("SKIP: no pending fees to claim | pending_fees=0 DACC")
+                    break
+                log("CLAIM FEES START | claimable=%s DACC", format_dacc_wei(pending_fees_wei))
+                function = contract.functions.claimFees()
+                tx_hash, receipt, fee_wei = send_contract_tx(w3, account, function, settings)
+                log(
+                    "CLAIM SENT | pending_fees=%s DACC | tx_hash=%s | fee_estimate=%s DACC",
+                    format_dacc_wei(pending_fees_wei),
+                    tx_hash,
+                    format_dacc_wei(fee_wei),
+                )
+                if getattr(receipt, "status", 0) != 1:
+                    raise RuntimeError(f"Claim transaction reverted: {tx_hash}")
+                remaining_fees_wei = int(contract.functions.pendingFees(account.address).call())
+                log(
+                    "CLAIM FEES CONFIRMED | tx_hash=%s | claimed=%s DACC | pending_after=%s DACC",
+                    tx_hash,
+                    format_dacc_wei(pending_fees_wei),
+                    format_dacc_wei(remaining_fees_wei),
+                )
+
+            else:
+                log_error("EXCHANGE ERROR | unknown operation=%s", operation)
+                return False
+
+            completed += 1
+            sleep_between_exchange_txs(tx_index)
+        except Exception as exc:
+            log_error("EXCHANGE TX ERROR | operation=%s | tx=%s/%s | %s", operation, tx_index, tx_count, exc)
+            break
+
+    log("EXCHANGE RESULT | operation=%s | completed=%s/%s", operation, completed, tx_count)
+    return completed > 0
 
 
 def run_wallet_crates_only(entry: WalletEntry, logger: logging.Logger) -> bool:
@@ -711,8 +1240,23 @@ def run_wallet_crates_only(entry: WalletEntry, logger: logging.Logger) -> bool:
         while True:
             try:
                 return callback()
-            except ApiError:
-                raise
+            except ApiError as exc:
+                attempt += 1
+                if not is_retryable_api_error(exc) or attempt > crate_retry_count:
+                    raise
+                log_error(
+                    "%s TEMP SERVER ERROR | attempt=%s/%s | status=%s | message=%s",
+                    action_name,
+                    attempt,
+                    crate_retry_count,
+                    exc.status,
+                    exc,
+                )
+                sleep_range(
+                    crate_retry_backoff_min,
+                    crate_retry_backoff_max,
+                    f"Sleeping before retrying {action_name} | seconds=%.2f",
+                )
             except Exception as exc:
                 attempt += 1
                 if attempt > crate_retry_count:
@@ -816,15 +1360,18 @@ def run_wallet_crates_only(entry: WalletEntry, logger: logging.Logger) -> bool:
             tx_hash = reward.get("tx_hash")
             if reward_type == "dacc" and isinstance(tx_hash, str) and tx_hash.startswith("pending:"):
                 dispense_id = tx_hash.replace("pending:", "", 1)
-                try:
-                    dispense_result = client.poll_dispense(
-                        dispense_id,
-                        timeout_seconds=int(settings.get("crate_poll_timeout_seconds", settings["poll_timeout_seconds"])),
-                        interval_seconds=float(settings["poll_interval_seconds"]),
-                    )
-                    log("CRATE DACC STATUS | dispense_id=%s | result=%s", dispense_id, dispense_result)
-                except Exception as exc:
-                    log_error("CRATE DACC STATUS ERROR | dispense_id=%s | %s", dispense_id, exc)
+                if not bool(settings.get("crate_poll_dacc_status", False)):
+                    log("CRATE DACC PENDING | dispense_id=%s | status_poll=disabled", dispense_id)
+                else:
+                    try:
+                        dispense_result = client.poll_dispense(
+                            dispense_id,
+                            timeout_seconds=int(settings.get("crate_poll_timeout_seconds", settings["poll_timeout_seconds"])),
+                            interval_seconds=float(settings["poll_interval_seconds"]),
+                        )
+                        log("CRATE DACC STATUS | dispense_id=%s | result=%s", dispense_id, dispense_result)
+                    except Exception as exc:
+                        log_error("CRATE DACC STATUS ERROR | dispense_id=%s | %s", dispense_id, exc)
         except ApiError as exc:
             log_error("CRATE OPEN ERROR | status=%s | message=%s | payload=%s", exc.status, exc, exc.payload)
             break
@@ -836,7 +1383,7 @@ def run_wallet_crates_only(entry: WalletEntry, logger: logging.Logger) -> bool:
     return opened > 0
 
 
-def run_all_wallets(logger: logging.Logger, mode: str) -> int:
+def run_all_wallets(logger: logging.Logger, mode: str, options: dict[str, Any] | None = None) -> int:
     entries = build_wallet_entries(logger)
     if not entries:
         logger.error("No valid wallets found.")
@@ -862,6 +1409,8 @@ def run_all_wallets(logger: logging.Logger, mode: str) -> int:
             result = run_wallet_badges_only(entry, logger)
         elif mode == "crates":
             result = run_wallet_crates_only(entry, logger)
+        elif mode == "exchange":
+            result = run_wallet_exchange_only(entry, logger, options or {})
         else:
             raise RuntimeError(f"Unknown mode: {mode}")
         if result:
@@ -878,6 +1427,64 @@ def run_all_wallets(logger: logging.Logger, mode: str) -> int:
     return 0 if success > 0 else 1
 
 
+def prompt_exchange_options() -> dict[str, Any]:
+    settings = load_settings()
+    print()
+    print("EXCHANGE")
+    print("1. Burn DACC -> QE")
+    print("2. Stake DACC")
+    print("3. Withdraw staked DACC")
+    print("4. Claim pending fees")
+    operation_choice = input(f"Select operation [{settings.get('exchange_operation', 'burn')}]: ").strip().lower()
+    operation_map = {
+        "1": "burn",
+        "burn": "burn",
+        "2": "deposit",
+        "deposit": "deposit",
+        "stake": "deposit",
+        "3": "withdraw",
+        "withdraw": "withdraw",
+        "unstake": "withdraw",
+        "4": "claim",
+        "claim": "claim",
+        "fees": "claim",
+        "claim_fees": "claim",
+        "claim fees": "claim",
+    }
+    operation = operation_map.get(operation_choice, str(settings.get("exchange_operation", "burn")).lower())
+
+    default_min = settings.get("exchange_percent_min", 5)
+    default_max = settings.get("exchange_percent_max", 10)
+    default_count = settings.get("exchange_transactions_count", 1)
+
+    if operation == "claim":
+        return {
+            "operation": operation,
+            "percent_min": parse_decimal(default_min, Decimal("5")),
+            "percent_max": parse_decimal(default_max, Decimal("10")),
+            "tx_count": 1,
+        }
+
+    percent_target = "DACC balance" if operation in {"burn", "deposit"} else "staked DACC"
+    min_input = input(f"Min percent of {percent_target} [{default_min}]: ").strip()
+    max_input = input(f"Max percent of {percent_target} [{default_max}]: ").strip()
+    count_input = input(f"Transactions per wallet [{default_count}]: ").strip()
+
+    percent_min = parse_decimal(min_input or default_min, parse_decimal(default_min, Decimal("5")))
+    percent_max = parse_decimal(max_input or default_max, parse_decimal(default_max, Decimal("10")))
+    try:
+        tx_count = int(count_input or default_count)
+    except ValueError:
+        tx_count = int(default_count)
+
+    return {
+        "operation": operation,
+        "percent_min": percent_min,
+        "percent_max": percent_max,
+        "tx_count": max(tx_count, 1),
+    }
+
+
 def main() -> int:
     logger = setup_logging()
     ensure_layout()
@@ -889,6 +1496,7 @@ def main() -> int:
         print("1. Faucet")
         print("2. Badges")
         print("3. Crates")
+        print("4. Exchange")
         print("0. Exit")
         print()
         choice = input("Select: ").strip()
@@ -898,6 +1506,8 @@ def main() -> int:
             return run_all_wallets(logger, "badges")
         if choice == "3":
             return run_all_wallets(logger, "crates")
+        if choice == "4":
+            return run_all_wallets(logger, "exchange", prompt_exchange_options())
         return 0
     except Exception as exc:
         logger.exception("FATAL ERROR | %s", exc)

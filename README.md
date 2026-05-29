@@ -6,8 +6,10 @@ Automation tool for DACHAIN Inception testnet.
 
 - Faucet
 - Badge claiming
+- Flash badge claiming
 - Rank NFT minting
 - Quantum crate opening
+- QE Pool exchange: burn, stake, withdraw, claim pending fees
 - Proxy support
 - Per-wallet logs
 
@@ -25,6 +27,7 @@ Automation tool for DACHAIN Inception testnet.
 1. Faucet
 2. Badges
 3. Crates
+4. Exchange
 0. Exit
 ```
 
@@ -45,7 +48,22 @@ Accepted formats:
 http://host:port
 http://login:password@host:port
 login:password@host:port
+http://host:port@login:password
 ```
+
+## Exchange
+
+The Exchange menu supports:
+
+```text
+1. Burn DACC -> QE
+2. Stake DACC
+3. Withdraw staked DACC
+4. Claim pending fees
+```
+
+Burn, stake, and withdraw use configurable min/max percentages and transaction count.
+Claim pending fees runs one claim transaction per wallet when fees are available.
 
 ## Settings
 
