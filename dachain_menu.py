@@ -190,6 +190,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "delay_between_exchange_txs_min_seconds": 2,
     "delay_between_exchange_txs_max_seconds": 5,
     "exchange_gas_reserve_dacc": "0.00005",
+    "exchange_burn_gas_limit": 350000,
+    "exchange_stake_gas_limit": 350000,
+    "exchange_withdraw_gas_limit": 350000,
+    "exchange_claim_gas_limit": 220000,
     "transactions_per_wallet": 1,
     "transaction_amount_min_dacc": "0.000000000000000001",
     "transaction_amount_max_dacc": "0.000000000000000003",
@@ -745,21 +749,27 @@ def send_contract_tx(
     settings: dict[str, Any],
     *,
     value_wei: int = 0,
+    gas_limit_override: int | None = None,
+    balance_check: bool = True,
 ) -> tuple[str, Any, int]:
     gas_price = w3.eth.gas_price
-    tx_base = {
-        "from": account.address,
-        "value": value_wei,
-    }
-    gas_estimate = function.estimate_gas(tx_base)
-    gas_limit = int(gas_estimate * 1.2) + 5000
+    if gas_limit_override and gas_limit_override > 0:
+        gas_limit = int(gas_limit_override)
+    else:
+        tx_base = {
+            "from": account.address,
+            "value": value_wei,
+        }
+        gas_estimate = function.estimate_gas(tx_base)
+        gas_limit = int(gas_estimate * 1.2) + 5000
     estimated_fee_wei = gas_limit * gas_price
-    balance_wei = w3.eth.get_balance(account.address)
-    if balance_wei < value_wei + estimated_fee_wei:
-        raise RuntimeError(
-            "Insufficient DACC for tx: "
-            f"balance={wei_to_decimal(balance_wei)} required={wei_to_decimal(value_wei + estimated_fee_wei)}"
-        )
+    if balance_check:
+        balance_wei = w3.eth.get_balance(account.address)
+        if balance_wei < value_wei + estimated_fee_wei:
+            raise RuntimeError(
+                "Insufficient DACC for tx: "
+                f"balance={wei_to_decimal(balance_wei)} required={wei_to_decimal(value_wei + estimated_fee_wei)}"
+            )
     nonce = w3.eth.get_transaction_count(account.address, "pending")
     tx = function.build_transaction(
         {
@@ -1302,37 +1312,43 @@ def run_wallet_exchange_only(
         log_error("EXCHANGE SETUP ERROR | %s", exc)
         return False
 
+    profile_balance_wei = decimal_to_wei(parse_decimal(str(profile.get("dacc_balance", "0") or "0")))
+    burn_gas_limit = int(settings.get("exchange_burn_gas_limit", 350000))
+    stake_gas_limit = int(settings.get("exchange_stake_gas_limit", 350000))
+    withdraw_gas_limit = int(settings.get("exchange_withdraw_gas_limit", 350000))
+    claim_gas_limit = int(settings.get("exchange_claim_gas_limit", 220000))
+
     completed = 0
     for tx_index in range(1, tx_count + 1):
         try:
-            balance_wei = w3.eth.get_balance(account.address)
-            lp_position = contract.functions.lps(account.address).call()
-            staked_wei = int(lp_position[0] if isinstance(lp_position, (list, tuple)) else getattr(lp_position, "staked", 0))
-            pending_fees_wei = int(contract.functions.pendingFees(account.address).call())
-            total_staked_wei = int(contract.functions.totalStaked().call())
-            total_burned_wei = int(contract.functions.totalBurned().call())
-            burn_bps = int(contract.functions.burnBps().call())
-
-            log(
-                "Exchange status | tx=%s/%s | balance=%s DACC | staked=%s DACC | pending_fees=%s DACC | total_staked=%s DACC | total_burned=%s DACC | burn_bps=%s",
-                tx_index,
-                tx_count,
-                format_dacc_wei(balance_wei),
-                format_dacc_wei(staked_wei),
-                format_dacc_wei(pending_fees_wei),
-                format_dacc_wei(total_staked_wei),
-                format_dacc_wei(total_burned_wei),
-                burn_bps,
-            )
-
             if operation == "burn":
+                try:
+                    balance_wei = w3.eth.get_balance(account.address)
+                    log("Exchange status | tx=%s/%s | balance=%s DACC", tx_index, tx_count, format_dacc_wei(balance_wei))
+                except Exception as exc:
+                    balance_wei = profile_balance_wei
+                    log_error(
+                        "EXCHANGE BALANCE RPC ERROR | using profile balance | tx=%s/%s | profile_balance=%s DACC | %s",
+                        tx_index,
+                        tx_count,
+                        format_dacc_wei(balance_wei),
+                        exc,
+                    )
                 spendable_wei = max(balance_wei - gas_reserve_wei, 0)
                 amount_wei, chosen_percent = random_percent_wei(spendable_wei, percent_min, percent_max)
                 if amount_wei <= 0:
                     log("SKIP: insufficient DACC for burn | balance=%s DACC", format_dacc_wei(balance_wei))
                     break
                 function = contract.functions.burnForQE()
-                tx_hash, receipt, fee_wei = send_contract_tx(w3, account, function, settings, value_wei=amount_wei)
+                tx_hash, receipt, fee_wei = send_contract_tx(
+                    w3,
+                    account,
+                    function,
+                    settings,
+                    value_wei=amount_wei,
+                    gas_limit_override=burn_gas_limit,
+                    balance_check=False,
+                )
                 log(
                     "BURN SENT | amount=%s DACC | percent=%.4f | tx_hash=%s | fee_estimate=%s DACC",
                     format_dacc_wei(amount_wei),
@@ -1351,13 +1367,33 @@ def run_wallet_exchange_only(
                 )
 
             elif operation in {"deposit", "stake"}:
+                try:
+                    balance_wei = w3.eth.get_balance(account.address)
+                    log("Exchange status | tx=%s/%s | balance=%s DACC", tx_index, tx_count, format_dacc_wei(balance_wei))
+                except Exception as exc:
+                    balance_wei = profile_balance_wei
+                    log_error(
+                        "EXCHANGE BALANCE RPC ERROR | using profile balance | tx=%s/%s | profile_balance=%s DACC | %s",
+                        tx_index,
+                        tx_count,
+                        format_dacc_wei(balance_wei),
+                        exc,
+                    )
                 spendable_wei = max(balance_wei - gas_reserve_wei, 0)
                 amount_wei, chosen_percent = random_percent_wei(spendable_wei, percent_min, percent_max)
                 if amount_wei <= 0:
                     log("SKIP: insufficient DACC for deposit | balance=%s DACC", format_dacc_wei(balance_wei))
                     break
                 function = contract.functions.stake()
-                tx_hash, receipt, fee_wei = send_contract_tx(w3, account, function, settings, value_wei=amount_wei)
+                tx_hash, receipt, fee_wei = send_contract_tx(
+                    w3,
+                    account,
+                    function,
+                    settings,
+                    value_wei=amount_wei,
+                    gas_limit_override=stake_gas_limit,
+                    balance_check=False,
+                )
                 log(
                     "DEPOSIT SENT | amount=%s DACC | percent=%.4f | tx_hash=%s | fee_estimate=%s DACC",
                     format_dacc_wei(amount_wei),
@@ -1374,12 +1410,22 @@ def run_wallet_exchange_only(
                     log_error("DEPOSIT CONFIRM API ERROR | tx_hash=%s | status=%s | message=%s | payload=%s", tx_hash, exc.status, exc, exc.payload)
 
             elif operation in {"withdraw", "unstake"}:
+                lp_position = contract.functions.lps(account.address).call()
+                staked_wei = int(lp_position[0] if isinstance(lp_position, (list, tuple)) else getattr(lp_position, "staked", 0))
+                log("Exchange status | tx=%s/%s | staked=%s DACC", tx_index, tx_count, format_dacc_wei(staked_wei))
                 amount_wei, chosen_percent = random_percent_wei(staked_wei, percent_min, percent_max)
                 if amount_wei <= 0:
                     log("SKIP: no staked DACC for withdraw | staked=%s DACC", format_dacc_wei(staked_wei))
                     break
                 function = contract.functions.unstake(amount_wei)
-                tx_hash, receipt, fee_wei = send_contract_tx(w3, account, function, settings)
+                tx_hash, receipt, fee_wei = send_contract_tx(
+                    w3,
+                    account,
+                    function,
+                    settings,
+                    gas_limit_override=withdraw_gas_limit,
+                    balance_check=False,
+                )
                 log(
                     "WITHDRAW SENT | amount=%s DACC | percent=%.4f | tx_hash=%s | fee_estimate=%s DACC",
                     format_dacc_wei(amount_wei),
@@ -1392,26 +1438,44 @@ def run_wallet_exchange_only(
                 log("WITHDRAW CONFIRMED | tx_hash=%s", tx_hash)
 
             elif operation == "claim":
-                if pending_fees_wei <= 0:
+                pending_fees_wei: int | None
+                try:
+                    pending_fees_wei = int(contract.functions.pendingFees(account.address).call())
+                    log("Exchange status | tx=%s/%s | pending_fees=%s DACC", tx_index, tx_count, format_dacc_wei(pending_fees_wei))
+                except Exception as exc:
+                    pending_fees_wei = None
+                    log_error("CLAIM FEES READ ERROR | sending claim anyway | tx=%s/%s | %s", tx_index, tx_count, exc)
+                if pending_fees_wei is not None and pending_fees_wei <= 0:
                     log("SKIP: no pending fees to claim | pending_fees=0 DACC")
                     break
-                log("CLAIM FEES START | claimable=%s DACC", format_dacc_wei(pending_fees_wei))
+                claimable_text = format_dacc_wei(pending_fees_wei) if pending_fees_wei is not None else "unknown"
+                log("CLAIM FEES START | claimable=%s DACC", claimable_text)
                 function = contract.functions.claimFees()
-                tx_hash, receipt, fee_wei = send_contract_tx(w3, account, function, settings)
+                tx_hash, receipt, fee_wei = send_contract_tx(
+                    w3,
+                    account,
+                    function,
+                    settings,
+                    gas_limit_override=claim_gas_limit,
+                    balance_check=False,
+                )
                 log(
                     "CLAIM SENT | pending_fees=%s DACC | tx_hash=%s | fee_estimate=%s DACC",
-                    format_dacc_wei(pending_fees_wei),
+                    claimable_text,
                     tx_hash,
                     format_dacc_wei(fee_wei),
                 )
                 if getattr(receipt, "status", 0) != 1:
                     raise RuntimeError(f"Claim transaction reverted: {tx_hash}")
-                remaining_fees_wei = int(contract.functions.pendingFees(account.address).call())
+                try:
+                    pending_after_text = f"{format_dacc_wei(int(contract.functions.pendingFees(account.address).call()))} DACC"
+                except Exception as exc:
+                    pending_after_text = f"unknown ({exc})"
                 log(
-                    "CLAIM FEES CONFIRMED | tx_hash=%s | claimed=%s DACC | pending_after=%s DACC",
+                    "CLAIM FEES CONFIRMED | tx_hash=%s | claimed=%s DACC | pending_after=%s",
                     tx_hash,
-                    format_dacc_wei(pending_fees_wei),
-                    format_dacc_wei(remaining_fees_wei),
+                    claimable_text,
+                    pending_after_text,
                 )
 
             else:
