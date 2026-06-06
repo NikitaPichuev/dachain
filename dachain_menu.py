@@ -358,13 +358,18 @@ def get_web3_for_proxy(settings: dict[str, Any], proxy: str | None) -> Web3:
     return Web3(provider)
 
 
-def rpc_proxy_candidates(entry: WalletEntry, settings: dict[str, Any]) -> list[str | None]:
+def rpc_proxy_candidates(
+    entry: WalletEntry,
+    settings: dict[str, Any],
+    excluded_proxies: set[str] | None = None,
+) -> list[str | None]:
     if not bool(settings.get("use_proxy_for_rpc", False)):
         return [None]
 
+    excluded_proxies = excluded_proxies or set()
     candidates: list[str | None] = []
     seen: set[str] = set()
-    if entry.proxy:
+    if entry.proxy and entry.proxy not in excluded_proxies:
         candidates.append(entry.proxy)
         seen.add(entry.proxy)
 
@@ -374,7 +379,7 @@ def rpc_proxy_candidates(entry: WalletEntry, settings: dict[str, Any]) -> list[s
                 proxy = normalize_proxy(raw_proxy)
             except Exception:
                 continue
-            if proxy and proxy not in seen:
+            if proxy and proxy not in seen and proxy not in excluded_proxies:
                 candidates.append(proxy)
                 seen.add(proxy)
 
@@ -393,7 +398,7 @@ def get_connected_web3(
     excluded_proxies: set[str] | None = None,
 ) -> tuple[Web3 | None, str | None]:
     excluded_proxies = excluded_proxies or set()
-    candidates = [proxy for proxy in rpc_proxy_candidates(entry, settings) if not proxy or proxy not in excluded_proxies]
+    candidates = rpc_proxy_candidates(entry, settings, excluded_proxies)
     if not candidates:
         log_error("%s RPC ERROR | no proxy candidates available", context)
         return None, None
@@ -410,6 +415,8 @@ def get_connected_web3(
             return w3, proxy
         except Exception as exc:
             log_error("%s RPC CONNECT ERROR | attempt=%s/%s | proxy=%s | %s", context, attempt, len(candidates), proxy or "-", exc)
+            if proxy:
+                excluded_proxies.add(proxy)
 
     return None, None
 
@@ -1357,7 +1364,11 @@ def run_wallet_exchange_only(
         return False
 
     try:
-        w3, rpc_proxy = get_connected_web3(entry, settings, log, log_error, "EXCHANGE")
+        run_bad_rpc_proxies = exchange_options.get("rpc_bad_proxies")
+        if not isinstance(run_bad_rpc_proxies, set):
+            run_bad_rpc_proxies = set()
+            exchange_options["rpc_bad_proxies"] = run_bad_rpc_proxies
+        w3, rpc_proxy = get_connected_web3(entry, settings, log, log_error, "EXCHANGE", run_bad_rpc_proxies)
         if not w3:
             return False
         log("EXCHANGE RPC OK | proxy=%s", rpc_proxy or "-")
@@ -1373,7 +1384,10 @@ def run_wallet_exchange_only(
     withdraw_gas_limit = int(settings.get("exchange_withdraw_gas_limit", 350000))
     claim_gas_limit = int(settings.get("exchange_claim_gas_limit", 220000))
     exchange_rpc_tx_retry_count = max(int(settings.get("exchange_rpc_tx_retry_count", 3)), 1)
-    bad_rpc_proxies: set[str] = set()
+    bad_rpc_proxies = exchange_options.get("rpc_bad_proxies")
+    if not isinstance(bad_rpc_proxies, set):
+        bad_rpc_proxies = set()
+        exchange_options["rpc_bad_proxies"] = bad_rpc_proxies
 
     completed = 0
     for tx_index in range(1, tx_count + 1):
