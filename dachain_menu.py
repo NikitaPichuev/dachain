@@ -163,6 +163,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "delay_between_wallets_max_seconds": 6,
     "delay_between_rank_mints_min_seconds": 1,
     "delay_between_rank_mints_max_seconds": 4,
+    "rank_mint_gas_limit": 180000,
     "use_proxy_for_rpc": True,
     "delay_between_faucet_requests_min_seconds": 2,
     "delay_between_faucet_requests_max_seconds": 5,
@@ -637,7 +638,15 @@ def mint_rank_badges(
             abi=RANK_BADGE_ABI,
         )
         account = Account.from_key(entry.private_key if entry.private_key.startswith("0x") else f"0x{entry.private_key}")
-        onchain_balance_wei = w3.eth.get_balance(account.address)
+        try:
+            onchain_balance_wei = w3.eth.get_balance(account.address)
+        except Exception as exc:
+            onchain_balance_wei = decimal_to_wei(parse_decimal(str(profile.get("dacc_balance", "0") or "0")))
+            log_error(
+                "RANK MINT BALANCE RPC ERROR | using profile balance | profile_dacc_balance=%s | %s",
+                profile.get("dacc_balance"),
+                exc,
+            )
         onchain_balance = onchain_balance_wei / 10**18
         log(
             "RPC OK | address=%s | rpc_proxy=%s | onchain_dacc_balance=%.18f | profile_dacc_balance=%s",
@@ -662,6 +671,9 @@ def mint_rank_badges(
     current_profile = profile
     rank_mint_delay_min = float(settings.get("delay_between_rank_mints_min_seconds", 1))
     rank_mint_delay_max = float(settings.get("delay_between_rank_mints_max_seconds", 4))
+    rank_mint_gas_limit = int(settings.get("rank_mint_gas_limit", 180000))
+    fixed_gas_price_gwei = parse_decimal(settings.get("rpc_fixed_gas_price_gwei", "0"))
+    rank_gas_price = gwei_to_wei(fixed_gas_price_gwei) if fixed_gas_price_gwei > 0 else w3.eth.gas_price
     if rank_mint_delay_max < rank_mint_delay_min:
         rank_mint_delay_min, rank_mint_delay_max = rank_mint_delay_max, rank_mint_delay_min
 
@@ -673,7 +685,11 @@ def mint_rank_badges(
             signature_hex = str(signature_data["signature"])
             signature_bytes = bytes.fromhex(signature_hex.removeprefix("0x"))
 
-            already_minted = contract.functions.hasMinted(account.address, rank_id).call()
+            try:
+                already_minted = contract.functions.hasMinted(account.address, rank_id).call()
+            except Exception as exc:
+                already_minted = False
+                log_error("RANK HASMINTED RPC ERROR | rank_key=%s | rank_id=%s | minting anyway | %s", rank_key, rank_id, exc)
             if already_minted:
                 previous_tx_hash = find_last_rank_tx_hash(account.address, str(rank_key))
                 if not previous_tx_hash:
@@ -702,11 +718,9 @@ def mint_rank_badges(
                 continue
 
             nonce = w3.eth.get_transaction_count(account.address)
-            gas_price = w3.eth.gas_price
             function = contract.functions.claimRank(rank_id, signature_bytes)
-            gas_estimate = function.estimate_gas({"from": account.address})
-            gas_limit = int(gas_estimate * 1.2) + 5000
-            estimated_fee_wei = gas_limit * gas_price
+            gas_limit = rank_mint_gas_limit
+            estimated_fee_wei = gas_limit * rank_gas_price
             if onchain_balance_wei < estimated_fee_wei:
                 estimated_fee = estimated_fee_wei / 10**18
                 log(
@@ -723,7 +737,7 @@ def mint_rank_badges(
                     "chainId": DAC_TESTNET_CHAIN_ID,
                     "nonce": nonce,
                     "gas": gas_limit,
-                    "gasPrice": gas_price,
+                    "gasPrice": rank_gas_price,
                 }
             )
             signed = account.sign_transaction(tx)
@@ -731,10 +745,13 @@ def mint_rank_badges(
             tx_hash_hex = normalize_tx_hash(tx_hash.hex())
             log("Rank mint sent | rank_key=%s | rank_id=%s | tx_hash=%s", rank_key, rank_id, tx_hash_hex)
 
-            receipt = w3.eth.wait_for_transaction_receipt(
-                tx_hash,
-                timeout=max(int(settings["poll_timeout_seconds"]), 120),
-            )
+            try:
+                receipt = w3.eth.wait_for_transaction_receipt(
+                    tx_hash,
+                    timeout=max(int(settings["poll_timeout_seconds"]), 120),
+                )
+            except Exception as exc:
+                raise TxSubmittedError(tx_hash_hex, f"Rank mint submitted but receipt wait failed: {exc}") from exc
             log("Rank mint receipt | rank_key=%s | status=%s | block=%s", rank_key, getattr(receipt, "status", None), getattr(receipt, "blockNumber", None))
             if getattr(receipt, "status", 0) != 1:
                 raise RuntimeError(f"Transaction reverted: {tx_hash_hex}")
@@ -742,10 +759,28 @@ def mint_rank_badges(
             client.nft_confirm_mint(rank_key, tx_hash_hex)
             log("Rank mint confirmed | rank_key=%s | tx_hash=%s", rank_key, tx_hash_hex)
             current_profile = client.profile()
-            onchain_balance_wei = w3.eth.get_balance(account.address)
+            try:
+                onchain_balance_wei = w3.eth.get_balance(account.address)
+            except Exception as exc:
+                log_error("RANK MINT BALANCE REFRESH ERROR | rank_key=%s | %s", rank_key, exc)
         except ApiError as exc:
             all_ok = False
             log_error("RANK MINT API ERROR | rank_key=%s | status=%s | message=%s | payload=%s", rank_key, exc.status, exc, exc.payload)
+        except TxSubmittedError as exc:
+            all_ok = False
+            log_error("RANK MINT SUBMITTED BUT RECEIPT FAILED | rank_key=%s | tx_hash=%s | %s", rank_key, exc.tx_hash, exc)
+            try:
+                client.nft_confirm_mint(rank_key, exc.tx_hash)
+                log("Rank mint confirm after receipt failure | rank_key=%s | tx_hash=%s", rank_key, exc.tx_hash)
+                current_profile = client.profile()
+            except ApiError as api_exc:
+                log_error(
+                    "RANK MINT CONFIRM AFTER RECEIPT ERROR | rank_key=%s | status=%s | message=%s | payload=%s",
+                    rank_key,
+                    api_exc.status,
+                    api_exc,
+                    api_exc.payload,
+                )
         except Exception as exc:
             all_ok = False
             log_error("RANK MINT ERROR | rank_key=%s | %s", rank_key, exc)

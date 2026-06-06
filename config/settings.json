@@ -10,6 +10,7 @@
   "delay_between_wallets_max_seconds": 6,
   "delay_between_rank_mints_min_seconds": 1,
   "delay_between_rank_mints_max_seconds": 4,
+  "rank_mint_gas_limit": 180000,
   "use_proxy_for_rpc": true,
   "delay_between_faucet_requests_min_seconds": 2,
   "delay_between_faucet_requests_max_seconds": 5,
