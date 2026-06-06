@@ -194,6 +194,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "exchange_stake_gas_limit": 350000,
     "exchange_withdraw_gas_limit": 350000,
     "exchange_claim_gas_limit": 220000,
+    "exchange_rpc_tx_retry_count": 3,
+    "rpc_fixed_gas_price_gwei": "1",
     "transactions_per_wallet": 1,
     "transaction_amount_min_dacc": "0.000000000000000001",
     "transaction_amount_max_dacc": "0.000000000000000003",
@@ -387,8 +389,10 @@ def get_connected_web3(
     log: Any,
     log_error: Any,
     context: str,
+    excluded_proxies: set[str] | None = None,
 ) -> tuple[Web3 | None, str | None]:
-    candidates = rpc_proxy_candidates(entry, settings)
+    excluded_proxies = excluded_proxies or set()
+    candidates = [proxy for proxy in rpc_proxy_candidates(entry, settings) if not proxy or proxy not in excluded_proxies]
     if not candidates:
         log_error("%s RPC ERROR | no proxy candidates available", context)
         return None, None
@@ -433,6 +437,12 @@ def decimal_to_wei(value: Decimal) -> int:
     return int((value * Decimal(10**18)).to_integral_value(rounding=ROUND_DOWN))
 
 
+def gwei_to_wei(value: Decimal) -> int:
+    if value <= 0:
+        return 0
+    return int((value * Decimal(10**9)).to_integral_value(rounding=ROUND_DOWN))
+
+
 def wei_to_decimal(value: int) -> Decimal:
     return Decimal(int(value)) / Decimal(10**18)
 
@@ -456,6 +466,12 @@ def random_percent_wei(base_wei: int, percent_min: Decimal, percent_max: Decimal
     chosen = Decimal(str(random.uniform(float(percent_min), float(percent_max))))
     amount_wei = int((Decimal(base_wei) * chosen / Decimal("100")).to_integral_value(rounding=ROUND_DOWN))
     return amount_wei, chosen
+
+
+class TxSubmittedError(RuntimeError):
+    def __init__(self, tx_hash: str, message: str) -> None:
+        super().__init__(message)
+        self.tx_hash = tx_hash
 
 
 def find_last_rank_tx_hash(address: str, rank_key: str) -> str | None:
@@ -752,7 +768,8 @@ def send_contract_tx(
     gas_limit_override: int | None = None,
     balance_check: bool = True,
 ) -> tuple[str, Any, int]:
-    gas_price = w3.eth.gas_price
+    fixed_gas_price_gwei = parse_decimal(settings.get("rpc_fixed_gas_price_gwei", "0"))
+    gas_price = gwei_to_wei(fixed_gas_price_gwei) if fixed_gas_price_gwei > 0 else w3.eth.gas_price
     if gas_limit_override and gas_limit_override > 0:
         gas_limit = int(gas_limit_override)
     else:
@@ -784,10 +801,13 @@ def send_contract_tx(
     signed = account.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     tx_hash_hex = normalize_tx_hash(tx_hash.hex())
-    receipt = w3.eth.wait_for_transaction_receipt(
-        tx_hash,
-        timeout=max(int(settings["poll_timeout_seconds"]), 120),
-    )
+    try:
+        receipt = w3.eth.wait_for_transaction_receipt(
+            tx_hash,
+            timeout=max(int(settings["poll_timeout_seconds"]), 120),
+        )
+    except Exception as exc:
+        raise TxSubmittedError(tx_hash_hex, f"Transaction submitted but receipt wait failed: {exc}") from exc
     return tx_hash_hex, receipt, estimated_fee_wei
 
 
@@ -1317,6 +1337,8 @@ def run_wallet_exchange_only(
     stake_gas_limit = int(settings.get("exchange_stake_gas_limit", 350000))
     withdraw_gas_limit = int(settings.get("exchange_withdraw_gas_limit", 350000))
     claim_gas_limit = int(settings.get("exchange_claim_gas_limit", 220000))
+    exchange_rpc_tx_retry_count = max(int(settings.get("exchange_rpc_tx_retry_count", 3)), 1)
+    bad_rpc_proxies: set[str] = set()
 
     completed = 0
     for tx_index in range(1, tx_count + 1):
@@ -1444,7 +1466,28 @@ def run_wallet_exchange_only(
                     log("Exchange status | tx=%s/%s | pending_fees=%s DACC", tx_index, tx_count, format_dacc_wei(pending_fees_wei))
                 except Exception as exc:
                     pending_fees_wei = None
-                    log_error("CLAIM FEES READ ERROR | sending claim anyway | tx=%s/%s | %s", tx_index, tx_count, exc)
+                    log_error("CLAIM FEES READ ERROR | reconnecting RPC | tx=%s/%s | proxy=%s | %s", tx_index, tx_count, rpc_proxy or "-", exc)
+                    if rpc_proxy:
+                        bad_rpc_proxies.add(rpc_proxy)
+                    for retry_index in range(1, exchange_rpc_tx_retry_count + 1):
+                        retry_w3, retry_proxy = get_connected_web3(entry, settings, log, log_error, "EXCHANGE CLAIM", bad_rpc_proxies)
+                        if not retry_w3:
+                            log_error("CLAIM FEES READ RETRY ERROR | no replacement RPC proxy; sending claim anyway")
+                            break
+                        w3 = retry_w3
+                        rpc_proxy = retry_proxy
+                        contract = w3.eth.contract(address=Web3.to_checksum_address(QE_POOL_CONTRACT), abi=QE_POOL_ABI)
+                        log("EXCHANGE CLAIM RPC RETRY OK | attempt=%s/%s | proxy=%s", retry_index, exchange_rpc_tx_retry_count, rpc_proxy or "-")
+                        try:
+                            pending_fees_wei = int(contract.functions.pendingFees(account.address).call())
+                            log("Exchange status | tx=%s/%s | pending_fees=%s DACC", tx_index, tx_count, format_dacc_wei(pending_fees_wei))
+                            break
+                        except Exception as retry_exc:
+                            log_error("CLAIM FEES READ RETRY ERROR | tx=%s/%s | proxy=%s | %s", tx_index, tx_count, rpc_proxy or "-", retry_exc)
+                            if rpc_proxy:
+                                bad_rpc_proxies.add(rpc_proxy)
+                    if pending_fees_wei is None:
+                        log_error("CLAIM FEES READ RETRIES EXHAUSTED | sending claim anyway")
                 if pending_fees_wei is not None and pending_fees_wei <= 0:
                     log("SKIP: no pending fees to claim | pending_fees=0 DACC")
                     break
@@ -1484,6 +1527,17 @@ def run_wallet_exchange_only(
 
             completed += 1
             sleep_between_exchange_txs(tx_index)
+        except TxSubmittedError as exc:
+            log_error(
+                "EXCHANGE TX SUBMITTED BUT RECEIPT FAILED | operation=%s | tx=%s/%s | tx_hash=%s | %s",
+                operation,
+                tx_index,
+                tx_count,
+                exc.tx_hash,
+                exc,
+            )
+            completed += 1
+            break
         except Exception as exc:
             log_error("EXCHANGE TX ERROR | operation=%s | tx=%s/%s | %s", operation, tx_index, tx_count, exc)
             break

@@ -41,6 +41,8 @@
   "exchange_stake_gas_limit": 350000,
   "exchange_withdraw_gas_limit": 350000,
   "exchange_claim_gas_limit": 220000,
+  "exchange_rpc_tx_retry_count": 3,
+  "rpc_fixed_gas_price_gwei": "1",
   "transactions_per_wallet": 1,
   "transaction_amount_min_dacc": "0.000000000000000001",
   "transaction_amount_max_dacc": "0.000000000000000003",
