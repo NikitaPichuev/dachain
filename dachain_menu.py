@@ -289,6 +289,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "hoodpix_quantity": 1,
     "hoodpix_allow_paid": False,
     "hoodpix_gas_limit": 350000,
+    "hoodpix_wait_for_public_mint": True,
+    "hoodpix_wait_poll_seconds": 2,
+    "hoodpix_wait_max_seconds": 86400,
     "delay_between_hoodpix_mints_min_seconds": 2,
     "delay_between_hoodpix_mints_max_seconds": 5,
     "ethereum_rpc_urls": ETHEREUM_MAINNET_RPC_URLS,
@@ -1198,6 +1201,9 @@ def run_wallet_hoodpix_mint(entry: WalletEntry, logger: logging.Logger) -> bool:
     quantity = max(int(settings.get("hoodpix_quantity", 1)), 1)
     allow_paid = bool(settings.get("hoodpix_allow_paid", False))
     gas_limit = int(settings.get("hoodpix_gas_limit", 350000))
+    wait_for_public_mint = bool(settings.get("hoodpix_wait_for_public_mint", True))
+    wait_poll_seconds = max(float(settings.get("hoodpix_wait_poll_seconds", 2)), 0.5)
+    wait_max_seconds = max(float(settings.get("hoodpix_wait_max_seconds", 86400)), 0)
     rpc_urls = settings.get("hoodpix_rpc_urls", HOODPIX_RPC_URLS)
     if not isinstance(rpc_urls, list) or not rpc_urls:
         rpc_urls = HOODPIX_RPC_URLS
@@ -1242,40 +1248,61 @@ def run_wallet_hoodpix_mint(entry: WalletEntry, logger: logging.Logger) -> bool:
         return False
 
     try:
-        wallet_minted, total_supply, max_supply = nft_contract.functions.getMintStats(account.address).call()
-        wallet_balance = int(nft_contract.functions.balanceOf(account.address).call())
-        public_drop = seadrop_contract.functions.getPublicDrop(nft_address).call()
-        mint_price_wei = int(public_drop[0])
-        start_time = int(public_drop[1])
-        end_time = int(public_drop[2])
-        max_per_wallet = int(public_drop[3])
-        fee_bps = int(public_drop[4])
-        restrict_fee_recipients = bool(public_drop[5])
-        now_ts = int(time.time())
-        allowed_fee_recipients = seadrop_contract.functions.getAllowedFeeRecipients(nft_address).call()
-        fee_recipient_allowed = seadrop_contract.functions.getFeeRecipientIsAllowed(nft_address, fee_recipient).call()
+        wait_started_at = time.time()
+        while True:
+            wallet_minted, total_supply, max_supply = nft_contract.functions.getMintStats(account.address).call()
+            wallet_balance = int(nft_contract.functions.balanceOf(account.address).call())
+            public_drop = seadrop_contract.functions.getPublicDrop(nft_address).call()
+            mint_price_wei = int(public_drop[0])
+            start_time = int(public_drop[1])
+            end_time = int(public_drop[2])
+            max_per_wallet = int(public_drop[3])
+            fee_bps = int(public_drop[4])
+            restrict_fee_recipients = bool(public_drop[5])
+            now_ts = int(time.time())
+            allowed_fee_recipients = seadrop_contract.functions.getAllowedFeeRecipients(nft_address).call()
+            fee_recipient_allowed = seadrop_contract.functions.getFeeRecipientIsAllowed(nft_address, fee_recipient).call()
 
-        log(
-            "HOODPIX STATUS | wallet_minted=%s | wallet_balance=%s | supply=%s/%s | price_wei=%s | max_per_wallet=%s | fee_bps=%s | window=%s-%s",
-            wallet_minted,
-            wallet_balance,
-            total_supply,
-            max_supply,
-            mint_price_wei,
-            max_per_wallet,
-            fee_bps,
-            start_time,
-            end_time,
-        )
+            log(
+                "HOODPIX STATUS | wallet_minted=%s | wallet_balance=%s | supply=%s/%s | price_wei=%s | max_per_wallet=%s | fee_bps=%s | window=%s-%s",
+                wallet_minted,
+                wallet_balance,
+                total_supply,
+                max_supply,
+                mint_price_wei,
+                max_per_wallet,
+                fee_bps,
+                start_time,
+                end_time,
+            )
+
+            if not start_time or now_ts >= start_time:
+                break
+            if not wait_for_public_mint:
+                log("SKIP: HOODPIX public mint not started | starts_at_unix=%s | now_unix=%s", start_time, now_ts)
+                return False
+            waited_seconds = time.time() - wait_started_at
+            if wait_max_seconds and waited_seconds >= wait_max_seconds:
+                log(
+                    "SKIP: HOODPIX wait limit reached | starts_at_unix=%s | now_unix=%s | waited_seconds=%.2f",
+                    start_time,
+                    now_ts,
+                    waited_seconds,
+                )
+                return False
+            sleep_seconds = min(wait_poll_seconds, max(float(start_time - now_ts), 0.5))
+            log(
+                "Waiting for HOODPIX public mint | starts_in_seconds=%s | sleep=%.2f",
+                max(start_time - now_ts, 0),
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
 
         if wallet_minted >= max_per_wallet or wallet_balance > 0:
             log("SKIP: HOODPIX already minted | wallet_minted=%s | wallet_balance=%s", wallet_minted, wallet_balance)
             return True
         if total_supply >= max_supply:
             log("SKIP: HOODPIX sold out | supply=%s/%s", total_supply, max_supply)
-            return False
-        if start_time and now_ts < start_time:
-            log("SKIP: HOODPIX public mint not started | starts_at_unix=%s | now_unix=%s", start_time, now_ts)
             return False
         if end_time and now_ts > end_time:
             log("SKIP: HOODPIX public mint ended | ends_at_unix=%s | now_unix=%s", end_time, now_ts)
