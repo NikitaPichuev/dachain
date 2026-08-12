@@ -289,11 +289,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "hoodpix_quantity": 1,
     "hoodpix_allow_paid": False,
     "hoodpix_gas_limit": 350000,
+    "hoodpix_wait_before_wallets": True,
     "hoodpix_wait_for_public_mint": True,
-    "hoodpix_wait_poll_seconds": 2,
+    "hoodpix_wait_poll_seconds": 0.2,
     "hoodpix_wait_max_seconds": 86400,
-    "delay_between_hoodpix_mints_min_seconds": 2,
-    "delay_between_hoodpix_mints_max_seconds": 5,
+    "delay_between_hoodpix_mints_min_seconds": 0,
+    "delay_between_hoodpix_mints_max_seconds": 0.2,
     "ethereum_rpc_urls": ETHEREUM_MAINNET_RPC_URLS,
     "robinhood_deposit_percent_min": 5,
     "robinhood_deposit_percent_max": 10,
@@ -1202,7 +1203,7 @@ def run_wallet_hoodpix_mint(entry: WalletEntry, logger: logging.Logger) -> bool:
     allow_paid = bool(settings.get("hoodpix_allow_paid", False))
     gas_limit = int(settings.get("hoodpix_gas_limit", 350000))
     wait_for_public_mint = bool(settings.get("hoodpix_wait_for_public_mint", True))
-    wait_poll_seconds = max(float(settings.get("hoodpix_wait_poll_seconds", 2)), 0.5)
+    wait_poll_seconds = max(float(settings.get("hoodpix_wait_poll_seconds", 0.2)), 0.1)
     wait_max_seconds = max(float(settings.get("hoodpix_wait_max_seconds", 86400)), 0)
     rpc_urls = settings.get("hoodpix_rpc_urls", HOODPIX_RPC_URLS)
     if not isinstance(rpc_urls, list) or not rpc_urls:
@@ -1290,7 +1291,7 @@ def run_wallet_hoodpix_mint(entry: WalletEntry, logger: logging.Logger) -> bool:
                     waited_seconds,
                 )
                 return False
-            sleep_seconds = min(wait_poll_seconds, max(float(start_time - now_ts), 0.5))
+            sleep_seconds = min(wait_poll_seconds, max(float(start_time - now_ts), 0.1))
             log(
                 "Waiting for HOODPIX public mint | starts_in_seconds=%s | sleep=%.2f",
                 max(start_time - now_ts, 0),
@@ -1347,6 +1348,75 @@ def run_wallet_hoodpix_mint(entry: WalletEntry, logger: logging.Logger) -> bool:
     except Exception as exc:
         log_error("HOODPIX MINT ERROR | %s", exc)
         return False
+
+
+def wait_for_hoodpix_public_mint(entries: list[WalletEntry], settings: dict[str, Any], logger: logging.Logger) -> None:
+    if not entries or not bool(settings.get("hoodpix_wait_before_wallets", True)):
+        return
+    if not bool(settings.get("hoodpix_wait_for_public_mint", True)):
+        return
+
+    wait_poll_seconds = max(float(settings.get("hoodpix_wait_poll_seconds", 0.2)), 0.1)
+    wait_max_seconds = max(float(settings.get("hoodpix_wait_max_seconds", 86400)), 0)
+    rpc_urls = settings.get("hoodpix_rpc_urls", HOODPIX_RPC_URLS)
+    if not isinstance(rpc_urls, list) or not rpc_urls:
+        rpc_urls = HOODPIX_RPC_URLS
+
+    def log_error(message: str, *args: Any) -> None:
+        logger.error(message, *args)
+
+    entry = entries[0]
+    w3, rpc_proxy, rpc_url = get_connected_web3_for_chain(
+        entry,
+        settings,
+        logger.info,
+        log_error,
+        "HOODPIX PREWAIT",
+        HOODPIX_CHAIN_ID,
+        [str(url) for url in rpc_urls],
+    )
+    if not w3:
+        logger.error("HOODPIX PREWAIT ERROR | no RPC available; continuing per-wallet checks")
+        return
+
+    nft_address = Web3.to_checksum_address(HOODPIX_COLLECTION_CONTRACT)
+    seadrop_address = Web3.to_checksum_address(HOODPIX_SEADROP_CONTRACT)
+    nft_contract = w3.eth.contract(address=nft_address, abi=HOODPIX_COLLECTION_ABI)
+    seadrop_contract = w3.eth.contract(address=seadrop_address, abi=HOODPIX_SEADROP_ABI)
+    wait_started_at = time.time()
+    logger.info("HOODPIX PREWAIT RPC OK | rpc=%s | proxy=%s", rpc_url or "-", rpc_proxy or "-")
+
+    while True:
+        try:
+            public_drop = seadrop_contract.functions.getPublicDrop(nft_address).call()
+            start_time = int(public_drop[1])
+            end_time = int(public_drop[2])
+            total_supply = int(nft_contract.functions.totalSupply().call())
+            max_supply = int(nft_contract.functions.getMintStats(entries[0].address).call()[2])
+            now_ts = int(time.time())
+            logger.info(
+                "HOODPIX PREWAIT STATUS | supply=%s/%s | window=%s-%s | now=%s",
+                total_supply,
+                max_supply,
+                start_time,
+                end_time,
+                now_ts,
+            )
+            if total_supply >= max_supply:
+                logger.info("HOODPIX PREWAIT STOP | sold out | supply=%s/%s", total_supply, max_supply)
+                return
+            if not start_time or now_ts >= start_time:
+                logger.info("HOODPIX PREWAIT DONE | public mint is active")
+                return
+            if wait_max_seconds and time.time() - wait_started_at >= wait_max_seconds:
+                logger.info("HOODPIX PREWAIT STOP | wait limit reached")
+                return
+            sleep_seconds = min(wait_poll_seconds, max(float(start_time - now_ts), 0.1))
+            logger.info("Waiting before HOODPIX wallet run | starts_in_seconds=%s | sleep=%.2f", max(start_time - now_ts, 0), sleep_seconds)
+            time.sleep(sleep_seconds)
+        except Exception as exc:
+            logger.error("HOODPIX PREWAIT ERROR | %s", exc)
+            time.sleep(wait_poll_seconds)
 
 
 def run_wallet_robinhood_deposit(
@@ -2257,6 +2327,8 @@ def run_all_wallets(logger: logging.Logger, mode: str, options: dict[str, Any] |
         options = options or {}
         options.setdefault("own_addresses", {entry.address.lower() for entry in entries})
         options.setdefault("used_recipients", set())
+    elif mode == "hoodpix":
+        wait_for_hoodpix_public_mint(entries, settings, logger)
 
     for entry in entries:
         print("-" * 72)

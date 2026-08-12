@@ -82,7 +82,8 @@ not reused during the same run.
 The HOOD PIX menu mints the public free phase through the SeaDrop contract on
 Robinhood Chain. Paid minting is blocked by default with `hoodpix_allow_paid=false`.
 If the public phase has not started yet, the bot waits for the on-chain
-`startTime` and sends `mintPublic` as soon as the public mint opens.
+`startTime`, checks every `0.2` seconds, and sends `mintPublic` as soon as
+the public mint opens. The wait happens once before processing all wallets.
 
 Default contract settings:
 

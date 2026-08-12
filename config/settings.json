@@ -38,11 +38,12 @@
   "hoodpix_quantity": 1,
   "hoodpix_allow_paid": false,
   "hoodpix_gas_limit": 350000,
+  "hoodpix_wait_before_wallets": true,
   "hoodpix_wait_for_public_mint": true,
-  "hoodpix_wait_poll_seconds": 2,
+  "hoodpix_wait_poll_seconds": 0.2,
   "hoodpix_wait_max_seconds": 86400,
-  "delay_between_hoodpix_mints_min_seconds": 2,
-  "delay_between_hoodpix_mints_max_seconds": 5,
+  "delay_between_hoodpix_mints_min_seconds": 0,
+  "delay_between_hoodpix_mints_max_seconds": 0.2,
   "ethereum_rpc_urls": [
     "https://ethereum-rpc.publicnode.com",
     "https://eth.llamarpc.com"
