@@ -40,6 +40,17 @@
   "hoodpix_gas_limit": 350000,
   "delay_between_hoodpix_mints_min_seconds": 2,
   "delay_between_hoodpix_mints_max_seconds": 5,
+  "ethereum_rpc_urls": [
+    "https://ethereum-rpc.publicnode.com",
+    "https://eth.llamarpc.com"
+  ],
+  "robinhood_deposit_percent_min": 5,
+  "robinhood_deposit_percent_max": 10,
+  "robinhood_deposit_transactions_count": 1,
+  "robinhood_deposit_gas_limit": 150000,
+  "robinhood_deposit_gas_reserve_eth": "0.003",
+  "delay_between_robinhood_deposits_min_seconds": 3,
+  "delay_between_robinhood_deposits_max_seconds": 8,
   "exchange_operation": "burn",
   "exchange_percent_min": 5,
   "exchange_percent_max": 10,

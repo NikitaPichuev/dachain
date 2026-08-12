@@ -12,6 +12,7 @@ Automation tool for DACHAIN Inception testnet.
 - QE Pool exchange: burn, stake, withdraw, claim pending fees
 - Native DACC transactions to unique external addresses
 - HOOD PIX public mint on Robinhood Chain through OpenSea SeaDrop
+- Native ETH deposit from Ethereum mainnet to Robinhood Chain
 - Proxy support
 - Per-wallet logs
 
@@ -32,6 +33,7 @@ Automation tool for DACHAIN Inception testnet.
 4. Exchange
 5. Transactions
 6. Hood Pix NFT
+7. Deposit to Robinhood Chain
 0. Exit
 ```
 
@@ -86,6 +88,18 @@ Default contract settings:
 Collection: 0xb324301d3a3707de79e6dbab524e6c7fcc544ad2
 SeaDrop:    0x00005EA00Ac477B1030CE78506496e8C2dE24bf5
 Chain ID:   4663
+```
+
+## Robinhood Chain Deposit
+
+The Deposit menu sends native ETH from Ethereum mainnet to Robinhood Chain through
+the canonical Delayed Inbox contract. The L2 recipient is the same wallet address.
+
+Default contract settings:
+
+```text
+Ethereum chain ID: 1
+Delayed Inbox:     0x6bCBA7cD81a5f12c10ca1Bf9b36761CC382658E8
 ```
 
 ## Settings
