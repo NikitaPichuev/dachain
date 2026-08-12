@@ -29,6 +29,14 @@ APP_LOG_PATH = LOGS_DIR / "app.log"
 RUNNER_VERSION = "menu-faucet-badges-1"
 DAC_TESTNET_CHAIN_ID = 21894
 DAC_TESTNET_RPC_URL = "https://rpctest.dachain.tech"
+HOODPIX_CHAIN_ID = 4663
+HOODPIX_RPC_URLS = [
+    "https://rpc.mainnet.chain.robinhood.com",
+    "https://rpc.arrowrpc.com",
+]
+HOODPIX_COLLECTION_CONTRACT = "0xb324301d3a3707de79e6dbab524e6c7fcc544ad2"
+HOODPIX_SEADROP_CONTRACT = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"
+HOODPIX_FEE_RECIPIENT = "0x0000a26b00c1F0DF003000390027140000fAa719"
 RANK_BADGE_CONTRACT = "0xB36ab4c2Bd6aCfC36e9D6c53F39F4301901Bd647"
 RANK_BADGE_ABI: list[dict[str, Any]] = [
     {
@@ -149,6 +157,84 @@ MINTAURA_ERC721_DROP_ABI: list[dict[str, Any]] = [
         "outputs": [{"name": "", "type": "uint256"}],
     },
 ]
+HOODPIX_COLLECTION_ABI: list[dict[str, Any]] = [
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "owner", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
+        "name": "getMintStats",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "minter", "type": "address"}],
+        "outputs": [
+            {"name": "minterNumMinted", "type": "uint256"},
+            {"name": "currentTotalSupply", "type": "uint256"},
+            {"name": "maxSupply", "type": "uint256"},
+        ],
+    },
+    {
+        "name": "totalSupply",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+]
+HOODPIX_SEADROP_ABI: list[dict[str, Any]] = [
+    {
+        "name": "getAllowedFeeRecipients",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "nftContract", "type": "address"}],
+        "outputs": [{"name": "", "type": "address[]"}],
+    },
+    {
+        "name": "getFeeRecipientIsAllowed",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [
+            {"name": "nftContract", "type": "address"},
+            {"name": "feeRecipient", "type": "address"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
+    },
+    {
+        "name": "getPublicDrop",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "nftContract", "type": "address"}],
+        "outputs": [
+            {
+                "name": "",
+                "type": "tuple",
+                "components": [
+                    {"name": "mintPrice", "type": "uint80"},
+                    {"name": "startTime", "type": "uint48"},
+                    {"name": "endTime", "type": "uint48"},
+                    {"name": "maxTotalMintableByWallet", "type": "uint16"},
+                    {"name": "feeBps", "type": "uint16"},
+                    {"name": "restrictFeeRecipients", "type": "bool"},
+                ],
+            }
+        ],
+    },
+    {
+        "name": "mintPublic",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "nftContract", "type": "address"},
+            {"name": "feeRecipient", "type": "address"},
+            {"name": "minterIfNotPayer", "type": "address"},
+            {"name": "quantity", "type": "uint256"},
+        ],
+        "outputs": [],
+    },
+]
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -184,6 +270,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "delay_between_mintaura_mints_min_seconds": 2,
     "delay_between_mintaura_mints_max_seconds": 5,
     "mintaura_allow_paid": False,
+    "hoodpix_rpc_urls": HOODPIX_RPC_URLS,
+    "hoodpix_quantity": 1,
+    "hoodpix_allow_paid": False,
+    "hoodpix_gas_limit": 350000,
+    "delay_between_hoodpix_mints_min_seconds": 2,
+    "delay_between_hoodpix_mints_max_seconds": 5,
     "exchange_operation": "burn",
     "exchange_percent_min": 5,
     "exchange_percent_max": 10,
@@ -358,6 +450,14 @@ def get_web3_for_proxy(settings: dict[str, Any], proxy: str | None) -> Web3:
     return Web3(provider)
 
 
+def get_web3_for_proxy_and_rpc(settings: dict[str, Any], proxy: str | None, rpc_url: str) -> Web3:
+    request_kwargs: dict[str, Any] = {"timeout": int(settings["request_timeout_seconds"])}
+    if proxy and bool(settings.get("use_proxy_for_rpc", False)):
+        request_kwargs["proxies"] = {"http": proxy, "https": proxy}
+    provider = Web3.HTTPProvider(rpc_url, request_kwargs=request_kwargs)
+    return Web3(provider)
+
+
 def rpc_proxy_candidates(
     entry: WalletEntry,
     settings: dict[str, Any],
@@ -419,6 +519,62 @@ def get_connected_web3(
                 excluded_proxies.add(proxy)
 
     return None, None
+
+
+def get_connected_web3_for_chain(
+    entry: WalletEntry,
+    settings: dict[str, Any],
+    log: Any,
+    log_error: Any,
+    context: str,
+    chain_id: int,
+    rpc_urls: list[str],
+    excluded_proxies: set[str] | None = None,
+) -> tuple[Web3 | None, str | None, str | None]:
+    excluded_proxies = excluded_proxies or set()
+    candidates = rpc_proxy_candidates(entry, settings, excluded_proxies)
+    if not candidates:
+        log_error("%s RPC ERROR | no proxy candidates available", context)
+        return None, None, None
+
+    total_attempts = max(len(candidates) * len(rpc_urls), 1)
+    attempt = 0
+    for rpc_url in rpc_urls:
+        for proxy in candidates:
+            attempt += 1
+            try:
+                w3 = get_web3_for_proxy_and_rpc(settings, proxy, rpc_url)
+                actual_chain_id = int(w3.eth.chain_id)
+                if actual_chain_id != chain_id:
+                    log_error(
+                        "%s RPC ERROR | attempt=%s/%s | rpc=%s | proxy=%s | wrong_chain_id=%s",
+                        context,
+                        attempt,
+                        total_attempts,
+                        rpc_url,
+                        proxy or "-",
+                        actual_chain_id,
+                    )
+                    continue
+                if proxy != entry.proxy:
+                    log("%s RPC proxy fallback OK | proxy=%s", context, proxy or "-")
+                if rpc_url != rpc_urls[0]:
+                    log("%s RPC URL fallback OK | rpc=%s", context, rpc_url)
+                return w3, proxy, rpc_url
+            except Exception as exc:
+                log_error(
+                    "%s RPC CONNECT ERROR | attempt=%s/%s | rpc=%s | proxy=%s | %s",
+                    context,
+                    attempt,
+                    total_attempts,
+                    rpc_url,
+                    proxy or "-",
+                    exc,
+                )
+                if proxy:
+                    excluded_proxies.add(proxy)
+
+    return None, None, None
 
 
 def normalize_tx_hash(tx_hash: Any) -> str:
@@ -809,6 +965,7 @@ def send_contract_tx(
     value_wei: int = 0,
     gas_limit_override: int | None = None,
     balance_check: bool = True,
+    chain_id: int = DAC_TESTNET_CHAIN_ID,
 ) -> tuple[str, Any, int]:
     fixed_gas_price_gwei = parse_decimal(settings.get("rpc_fixed_gas_price_gwei", "0"))
     gas_price = gwei_to_wei(fixed_gas_price_gwei) if fixed_gas_price_gwei > 0 else w3.eth.gas_price
@@ -833,7 +990,7 @@ def send_contract_tx(
     tx = function.build_transaction(
         {
             "from": account.address,
-            "chainId": DAC_TESTNET_CHAIN_ID,
+            "chainId": chain_id,
             "nonce": nonce,
             "gas": gas_limit,
             "gasPrice": gas_price,
@@ -1009,6 +1166,136 @@ def run_wallet_transactions_only(
 
     log("TRANSACTIONS RESULT | completed=%s/%s", completed, tx_count)
     return completed > 0
+
+
+def run_wallet_hoodpix_mint(entry: WalletEntry, logger: logging.Logger) -> bool:
+    settings = load_settings()
+    run_logger = create_run_logger(entry.index, entry.address)
+    quantity = max(int(settings.get("hoodpix_quantity", 1)), 1)
+    allow_paid = bool(settings.get("hoodpix_allow_paid", False))
+    gas_limit = int(settings.get("hoodpix_gas_limit", 350000))
+    rpc_urls = settings.get("hoodpix_rpc_urls", HOODPIX_RPC_URLS)
+    if not isinstance(rpc_urls, list) or not rpc_urls:
+        rpc_urls = HOODPIX_RPC_URLS
+
+    def log(message: str, *args: Any) -> None:
+        logger.info(message, *args)
+        run_logger.info(message, *args)
+
+    def log_error(message: str, *args: Any) -> None:
+        logger.error(message, *args)
+        run_logger.error(message, *args)
+
+    log(
+        "Wallet #%s | mode=hoodpix | quantity=%s | address=%s | proxy=%s",
+        entry.index,
+        quantity,
+        entry.address,
+        entry.proxy or "-",
+    )
+
+    try:
+        w3, rpc_proxy, rpc_url = get_connected_web3_for_chain(
+            entry,
+            settings,
+            log,
+            log_error,
+            "HOODPIX",
+            HOODPIX_CHAIN_ID,
+            [str(url) for url in rpc_urls],
+        )
+        if not w3:
+            return False
+        log("HOODPIX RPC OK | rpc=%s | proxy=%s", rpc_url or "-", rpc_proxy or "-")
+        account = Account.from_key(entry.private_key if entry.private_key.startswith("0x") else f"0x{entry.private_key}")
+        nft_address = Web3.to_checksum_address(HOODPIX_COLLECTION_CONTRACT)
+        seadrop_address = Web3.to_checksum_address(HOODPIX_SEADROP_CONTRACT)
+        fee_recipient = Web3.to_checksum_address(str(settings.get("hoodpix_fee_recipient", HOODPIX_FEE_RECIPIENT)))
+        nft_contract = w3.eth.contract(address=nft_address, abi=HOODPIX_COLLECTION_ABI)
+        seadrop_contract = w3.eth.contract(address=seadrop_address, abi=HOODPIX_SEADROP_ABI)
+    except Exception as exc:
+        log_error("HOODPIX SETUP ERROR | %s", exc)
+        return False
+
+    try:
+        wallet_minted, total_supply, max_supply = nft_contract.functions.getMintStats(account.address).call()
+        wallet_balance = int(nft_contract.functions.balanceOf(account.address).call())
+        public_drop = seadrop_contract.functions.getPublicDrop(nft_address).call()
+        mint_price_wei = int(public_drop[0])
+        start_time = int(public_drop[1])
+        end_time = int(public_drop[2])
+        max_per_wallet = int(public_drop[3])
+        fee_bps = int(public_drop[4])
+        restrict_fee_recipients = bool(public_drop[5])
+        now_ts = int(time.time())
+        allowed_fee_recipients = seadrop_contract.functions.getAllowedFeeRecipients(nft_address).call()
+        fee_recipient_allowed = seadrop_contract.functions.getFeeRecipientIsAllowed(nft_address, fee_recipient).call()
+
+        log(
+            "HOODPIX STATUS | wallet_minted=%s | wallet_balance=%s | supply=%s/%s | price_wei=%s | max_per_wallet=%s | fee_bps=%s | window=%s-%s",
+            wallet_minted,
+            wallet_balance,
+            total_supply,
+            max_supply,
+            mint_price_wei,
+            max_per_wallet,
+            fee_bps,
+            start_time,
+            end_time,
+        )
+
+        if wallet_minted >= max_per_wallet or wallet_balance > 0:
+            log("SKIP: HOODPIX already minted | wallet_minted=%s | wallet_balance=%s", wallet_minted, wallet_balance)
+            return True
+        if total_supply >= max_supply:
+            log("SKIP: HOODPIX sold out | supply=%s/%s", total_supply, max_supply)
+            return False
+        if start_time and now_ts < start_time:
+            log("SKIP: HOODPIX public mint not started | starts_at_unix=%s | now_unix=%s", start_time, now_ts)
+            return False
+        if end_time and now_ts > end_time:
+            log("SKIP: HOODPIX public mint ended | ends_at_unix=%s | now_unix=%s", end_time, now_ts)
+            return False
+        if mint_price_wei > 0 and not allow_paid:
+            log("SKIP: HOODPIX mint is paid | price_wei=%s | hoodpix_allow_paid=false", mint_price_wei)
+            return False
+        if restrict_fee_recipients and not fee_recipient_allowed:
+            log_error(
+                "HOODPIX FEE RECIPIENT ERROR | fee_recipient=%s | allowed=%s",
+                fee_recipient,
+                allowed_fee_recipients,
+            )
+            return False
+
+        value_wei = mint_price_wei * quantity
+        function = seadrop_contract.functions.mintPublic(nft_address, fee_recipient, account.address, quantity)
+        tx_hash, receipt, fee_wei = send_contract_tx(
+            w3,
+            account,
+            function,
+            settings,
+            value_wei=value_wei,
+            gas_limit_override=gas_limit,
+            chain_id=HOODPIX_CHAIN_ID,
+        )
+        log(
+            "HOODPIX MINT SENT | quantity=%s | value=%s ETH | tx_hash=%s | fee_estimate=%s ETH",
+            quantity,
+            format_dacc_wei(value_wei, places=9),
+            tx_hash,
+            format_dacc_wei(fee_wei, places=9),
+        )
+        if getattr(receipt, "status", 0) != 1:
+            raise RuntimeError(f"HOODPIX mint transaction reverted: {tx_hash}")
+        wallet_balance_after = int(nft_contract.functions.balanceOf(account.address).call())
+        log("HOODPIX MINT CONFIRMED | tx_hash=%s | wallet_balance=%s", tx_hash, wallet_balance_after)
+        return True
+    except TxSubmittedError as exc:
+        log_error("HOODPIX TX SUBMITTED BUT RECEIPT FAILED | tx_hash=%s | %s", exc.tx_hash, exc)
+        return True
+    except Exception as exc:
+        log_error("HOODPIX MINT ERROR | %s", exc)
+        return False
 
 
 def run_wallet(entry: WalletEntry, logger: logging.Logger) -> bool:
@@ -1787,6 +2074,9 @@ def run_all_wallets(logger: logging.Logger, mode: str, options: dict[str, Any] |
     settings = load_settings()
     delay_between_wallets_min = float(settings.get("delay_between_wallets_min_seconds", 3))
     delay_between_wallets_max = float(settings.get("delay_between_wallets_max_seconds", 6))
+    if mode == "hoodpix":
+        delay_between_wallets_min = float(settings.get("delay_between_hoodpix_mints_min_seconds", delay_between_wallets_min))
+        delay_between_wallets_max = float(settings.get("delay_between_hoodpix_mints_max_seconds", delay_between_wallets_max))
     if delay_between_wallets_max < delay_between_wallets_min:
         delay_between_wallets_min, delay_between_wallets_max = delay_between_wallets_max, delay_between_wallets_min
 
@@ -1813,6 +2103,8 @@ def run_all_wallets(logger: logging.Logger, mode: str, options: dict[str, Any] |
             result = run_wallet_exchange_only(entry, logger, options or {})
         elif mode == "transactions":
             result = run_wallet_transactions_only(entry, logger, options or {})
+        elif mode == "hoodpix":
+            result = run_wallet_hoodpix_mint(entry, logger)
         else:
             raise RuntimeError(f"Unknown mode: {mode}")
         if result:
@@ -1923,6 +2215,7 @@ def main() -> int:
         print("3. Crates")
         print("4. Exchange")
         print("5. Transactions")
+        print("6. Hood Pix NFT")
         print("0. Exit")
         print()
         choice = input("Select: ").strip()
@@ -1936,6 +2229,8 @@ def main() -> int:
             return run_all_wallets(logger, "exchange", prompt_exchange_options())
         if choice == "5":
             return run_all_wallets(logger, "transactions", prompt_transaction_options())
+        if choice == "6":
+            return run_all_wallets(logger, "hoodpix")
         return 0
     except Exception as exc:
         logger.exception("FATAL ERROR | %s", exc)

@@ -11,6 +11,7 @@ Automation tool for DACHAIN Inception testnet.
 - Quantum crate opening
 - QE Pool exchange: burn, stake, withdraw, claim pending fees
 - Native DACC transactions to unique external addresses
+- HOOD PIX public mint on Robinhood Chain through OpenSea SeaDrop
 - Proxy support
 - Per-wallet logs
 
@@ -30,6 +31,7 @@ Automation tool for DACHAIN Inception testnet.
 3. Crates
 4. Exchange
 5. Transactions
+6. Hood Pix NFT
 0. Exit
 ```
 
@@ -72,6 +74,19 @@ Claim pending fees runs one claim transaction per wallet when fees are available
 The Transactions menu sends small native DACC transfers to freshly generated unique
 external addresses. Recipients are checked against loaded wallet addresses and are
 not reused during the same run.
+
+## HOOD PIX NFT
+
+The HOOD PIX menu mints the public free phase through the SeaDrop contract on
+Robinhood Chain. Paid minting is blocked by default with `hoodpix_allow_paid=false`.
+
+Default contract settings:
+
+```text
+Collection: 0xb324301d3a3707de79e6dbab524e6c7fcc544ad2
+SeaDrop:    0x00005EA00Ac477B1030CE78506496e8C2dE24bf5
+Chain ID:   4663
+```
 
 ## Settings
 

@@ -31,6 +31,15 @@
   "delay_between_mintaura_mints_min_seconds": 2,
   "delay_between_mintaura_mints_max_seconds": 5,
   "mintaura_allow_paid": false,
+  "hoodpix_rpc_urls": [
+    "https://rpc.mainnet.chain.robinhood.com",
+    "https://rpc.arrowrpc.com"
+  ],
+  "hoodpix_quantity": 1,
+  "hoodpix_allow_paid": false,
+  "hoodpix_gas_limit": 350000,
+  "delay_between_hoodpix_mints_min_seconds": 2,
+  "delay_between_hoodpix_mints_max_seconds": 5,
   "exchange_operation": "burn",
   "exchange_percent_min": 5,
   "exchange_percent_max": 10,
