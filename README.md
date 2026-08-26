@@ -14,6 +14,7 @@ Automation tool for DACHAIN Inception testnet.
 - HOOD PIX public mint on Robinhood Chain through OpenSea SeaDrop
 - Native ETH deposit from Ethereum mainnet to Robinhood Chain
 - Native ETH withdrawal from Ink to Ethereum
+- Dinero iETH/riETH withdrawal from Ink through Dinero LayerZero contracts
 - Proxy support
 - Per-wallet logs
 
@@ -36,6 +37,7 @@ Automation tool for DACHAIN Inception testnet.
 6. Hood Pix NFT
 7. Deposit to Robinhood Chain
 8. Withdraw from Ink
+9. Dinero riETH
 0. Exit
 ```
 
@@ -125,6 +127,30 @@ L2 Standard Bridge: 0x4200000000000000000000000000000000000010
 
 Token balances and protocol positions, for example Dinero staked riETH, are not
 withdrawn by this menu item.
+
+## Dinero riETH
+
+The Dinero riETH menu handles Dinero positions on Ink:
+
+```text
+1. Withdraw riETH to Ethereum via Dinero LayerZero
+2. Unwrap iETH -> riETH only
+```
+
+The default withdraw operation reads both `iETH` and `riETH` balances. If there
+is not enough `riETH`, it first unwraps `iETH` into `riETH`, then calls
+`riETH.withdraw(...)` with the LayerZero fee returned by `quoteWithdraw`.
+
+The recipient defaults to the same wallet address. Delivery to Ethereum is
+handled by Dinero/LayerZero and may not be instant.
+
+Default contract settings:
+
+```text
+Ink chain ID: 57073
+iETH:         0x11476323D8DFCBAFac942588E2f38823d2Dd308e
+riETH:        0xcab283e4bb527Aa9b157Bae7180FeF19E2aaa71a
+```
 
 ## Settings
 

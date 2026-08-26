@@ -46,6 +46,9 @@ HOODPIX_RPC_URLS = [
 ]
 ROBINHOOD_DELAYED_INBOX = "0x6bCBA7cD81a5f12c10ca1Bf9b36761CC382658E8"
 INK_L2_STANDARD_BRIDGE = "0x4200000000000000000000000000000000000010"
+DINERO_IETH_CONTRACT = "0x11476323D8DFCBAFac942588E2f38823d2Dd308e"
+DINERO_RIETH_CONTRACT = "0xcab283e4bb527Aa9b157Bae7180FeF19E2aaa71a"
+DINERO_INK_WITHDRAW_OPTIONS = "0x00030100110100000000000000000000000000030d40"
 HOODPIX_COLLECTION_CONTRACT = "0xb324301d3a3707de79e6dbab524e6c7fcc544ad2"
 HOODPIX_SEADROP_CONTRACT = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"
 HOODPIX_FEE_RECIPIENT = "0x0000a26b00c1F0DF003000390027140000fAa719"
@@ -279,6 +282,63 @@ OP_L2_STANDARD_BRIDGE_ABI: list[dict[str, Any]] = [
         "outputs": [],
     },
 ]
+DINERO_RIETH_ABI: list[dict[str, Any]] = [
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "_account", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
+        "name": "quoteWithdraw",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [
+            {"name": "_receiver", "type": "address"},
+            {"name": "_amount", "type": "uint256"},
+            {"name": "_options", "type": "bytes"},
+        ],
+        "outputs": [
+            {
+                "name": "msgFee",
+                "type": "tuple",
+                "components": [
+                    {"name": "nativeFee", "type": "uint256"},
+                    {"name": "lzTokenFee", "type": "uint256"},
+                ],
+            }
+        ],
+    },
+    {
+        "name": "withdraw",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "_receiver", "type": "address"},
+            {"name": "_refundAddress", "type": "address"},
+            {"name": "_amount", "type": "uint256"},
+            {"name": "_options", "type": "bytes"},
+        ],
+        "outputs": [],
+    },
+]
+DINERO_IETH_ABI: list[dict[str, Any]] = [
+    {
+        "name": "balanceOf",
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "account", "type": "address"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+    {
+        "name": "unwrap",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [{"name": "_amount", "type": "uint256"}],
+        "outputs": [{"name": "", "type": "uint256"}],
+    },
+]
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -341,6 +401,18 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "ink_withdraw_gas_reserve_eth": "0.00005",
     "delay_between_ink_withdrawals_min_seconds": 3,
     "delay_between_ink_withdrawals_max_seconds": 8,
+    "dinero_ieth_contract": DINERO_IETH_CONTRACT,
+    "dinero_rieth_contract": DINERO_RIETH_CONTRACT,
+    "dinero_rieth_operation": "withdraw",
+    "dinero_rieth_percent_min": 80,
+    "dinero_rieth_percent_max": 95,
+    "dinero_rieth_transactions_count": 1,
+    "dinero_rieth_lz_withdraw_options": DINERO_INK_WITHDRAW_OPTIONS,
+    "dinero_rieth_unwrap_gas_limit": 180000,
+    "dinero_rieth_withdraw_gas_limit": 550000,
+    "dinero_rieth_gas_reserve_eth": "0.00005",
+    "delay_between_dinero_rieth_txs_min_seconds": 3,
+    "delay_between_dinero_rieth_txs_max_seconds": 8,
     "exchange_operation": "burn",
     "exchange_percent_min": 5,
     "exchange_percent_max": 10,
@@ -679,6 +751,17 @@ def wei_to_decimal(value: int) -> Decimal:
 def format_dacc_wei(value: int, places: int = 6) -> str:
     quant = Decimal(1).scaleb(-places)
     return str(wei_to_decimal(value).quantize(quant, rounding=ROUND_DOWN).normalize())
+
+
+def hex_to_bytes(value: Any) -> bytes:
+    text = str(value or "").strip()
+    if not text:
+        return b""
+    if text.startswith("0x"):
+        text = text[2:]
+    if len(text) % 2:
+        text = f"0{text}"
+    return bytes.fromhex(text)
 
 
 def normalize_percent_range(min_percent: Any, max_percent: Any) -> tuple[Decimal, Decimal]:
@@ -1699,6 +1782,217 @@ def run_wallet_ink_withdraw(
     return completed > 0
 
 
+def run_wallet_dinero_rieth(
+    entry: WalletEntry,
+    logger: logging.Logger,
+    dinero_options: dict[str, Any],
+) -> bool:
+    settings = load_settings()
+    run_logger = create_run_logger(entry.index, entry.address)
+    operation = str(dinero_options.get("operation") or settings.get("dinero_rieth_operation", "withdraw")).strip().lower()
+    tx_count = max(int(dinero_options.get("tx_count") or settings.get("dinero_rieth_transactions_count", 1)), 1)
+    percent_min, percent_max = normalize_percent_range(
+        dinero_options.get("percent_min", settings.get("dinero_rieth_percent_min", 80)),
+        dinero_options.get("percent_max", settings.get("dinero_rieth_percent_max", 95)),
+    )
+    recipient_input = str(dinero_options.get("recipient") or "").strip()
+    recipient = recipient_input or entry.address
+    ieth_address = Web3.to_checksum_address(str(settings.get("dinero_ieth_contract", DINERO_IETH_CONTRACT)))
+    rieth_address = Web3.to_checksum_address(str(settings.get("dinero_rieth_contract", DINERO_RIETH_CONTRACT)))
+    withdraw_options = hex_to_bytes(settings.get("dinero_rieth_lz_withdraw_options", DINERO_INK_WITHDRAW_OPTIONS))
+    unwrap_gas_limit = int(settings.get("dinero_rieth_unwrap_gas_limit", 180000))
+    withdraw_gas_limit = int(settings.get("dinero_rieth_withdraw_gas_limit", 550000))
+    gas_reserve_wei = decimal_to_wei(parse_decimal(settings.get("dinero_rieth_gas_reserve_eth", "0.00005")))
+    delay_min = float(settings.get("delay_between_dinero_rieth_txs_min_seconds", 3))
+    delay_max = float(settings.get("delay_between_dinero_rieth_txs_max_seconds", 8))
+    if delay_max < delay_min:
+        delay_min, delay_max = delay_max, delay_min
+    rpc_urls = settings.get("ink_rpc_urls", INK_RPC_URLS)
+    if not isinstance(rpc_urls, list) or not rpc_urls:
+        rpc_urls = INK_RPC_URLS
+
+    def log(message: str, *args: Any) -> None:
+        logger.info(message, *args)
+        run_logger.info(message, *args)
+
+    def log_error(message: str, *args: Any) -> None:
+        logger.error(message, *args)
+        run_logger.error(message, *args)
+
+    log(
+        "Wallet #%s | mode=dinero_rieth | operation=%s | percent=%s-%s | tx_count=%s | address=%s | recipient=%s | proxy=%s",
+        entry.index,
+        operation,
+        percent_min,
+        percent_max,
+        tx_count,
+        entry.address,
+        recipient,
+        entry.proxy or "-",
+    )
+
+    try:
+        recipient = Web3.to_checksum_address(recipient)
+    except Exception as exc:
+        log_error("DINERO RIETH RECIPIENT ERROR | recipient=%s | %s", recipient, exc)
+        return False
+
+    try:
+        w3, rpc_proxy, rpc_url = get_connected_web3_for_chain(
+            entry,
+            settings,
+            log,
+            log_error,
+            "DINERO RIETH",
+            INK_CHAIN_ID,
+            [str(url) for url in rpc_urls],
+        )
+        if not w3:
+            return False
+        log("DINERO RIETH RPC OK | rpc=%s | proxy=%s", rpc_url or "-", rpc_proxy or "-")
+        account = Account.from_key(entry.private_key if entry.private_key.startswith("0x") else f"0x{entry.private_key}")
+        ieth = w3.eth.contract(address=ieth_address, abi=DINERO_IETH_ABI)
+        rieth = w3.eth.contract(address=rieth_address, abi=DINERO_RIETH_ABI)
+    except Exception as exc:
+        log_error("DINERO RIETH SETUP ERROR | %s", exc)
+        return False
+
+    completed = 0
+    for tx_index in range(1, tx_count + 1):
+        try:
+            ieth_balance_wei = int(ieth.functions.balanceOf(account.address).call())
+            rieth_balance_wei = int(rieth.functions.balanceOf(account.address).call())
+            total_lst_wei = ieth_balance_wei + rieth_balance_wei
+            native_balance_wei = int(w3.eth.get_balance(account.address))
+            log(
+                "Dinero status | tx=%s/%s | ieth_balance=%s | rieth_balance=%s | ink_eth_balance=%s",
+                tx_index,
+                tx_count,
+                format_dacc_wei(ieth_balance_wei, places=9),
+                format_dacc_wei(rieth_balance_wei, places=9),
+                format_dacc_wei(native_balance_wei, places=9),
+            )
+            if total_lst_wei <= 0:
+                log("SKIP: no iETH/riETH balance")
+                break
+
+            amount_wei, chosen_percent = random_percent_wei(total_lst_wei, percent_min, percent_max)
+            if amount_wei <= 0:
+                log("SKIP: calculated Dinero amount is zero | total_ieth_rieth=%s", format_dacc_wei(total_lst_wei, places=9))
+                break
+
+            if operation in {"unwrap", "unwrap_only"}:
+                unwrap_amount_wei = min(amount_wei, ieth_balance_wei)
+                if unwrap_amount_wei <= 0:
+                    log("SKIP: no iETH balance to unwrap | ieth_balance=%s", format_dacc_wei(ieth_balance_wei, places=9))
+                    break
+                function = ieth.functions.unwrap(unwrap_amount_wei)
+                tx_hash, receipt, fee_wei = send_contract_tx(
+                    w3,
+                    account,
+                    function,
+                    settings,
+                    gas_limit_override=unwrap_gas_limit,
+                    chain_id=INK_CHAIN_ID,
+                    fixed_gas_price_setting="ink_fixed_gas_price_gwei",
+                )
+                log(
+                    "DINERO IETH UNWRAPPED | amount=%s iETH | percent=%.4f | tx_hash=%s | fee_estimate=%s ETH",
+                    format_dacc_wei(unwrap_amount_wei, places=9),
+                    float(chosen_percent),
+                    tx_hash,
+                    format_dacc_wei(fee_wei, places=9),
+                )
+                if getattr(receipt, "status", 0) != 1:
+                    raise RuntimeError(f"Dinero iETH unwrap reverted: {tx_hash}")
+                completed += 1
+            elif operation in {"withdraw", "rieth_withdraw"}:
+                if rieth_balance_wei < amount_wei:
+                    unwrap_needed_wei = min(amount_wei - rieth_balance_wei, ieth_balance_wei)
+                    if unwrap_needed_wei > 0:
+                        function = ieth.functions.unwrap(unwrap_needed_wei)
+                        tx_hash, receipt, fee_wei = send_contract_tx(
+                            w3,
+                            account,
+                            function,
+                            settings,
+                            gas_limit_override=unwrap_gas_limit,
+                            chain_id=INK_CHAIN_ID,
+                            fixed_gas_price_setting="ink_fixed_gas_price_gwei",
+                        )
+                        log(
+                            "DINERO IETH UNWRAPPED BEFORE WITHDRAW | amount=%s iETH | tx_hash=%s | fee_estimate=%s ETH",
+                            format_dacc_wei(unwrap_needed_wei, places=9),
+                            tx_hash,
+                            format_dacc_wei(fee_wei, places=9),
+                        )
+                        if getattr(receipt, "status", 0) != 1:
+                            raise RuntimeError(f"Dinero iETH unwrap reverted: {tx_hash}")
+                        rieth_balance_wei = int(rieth.functions.balanceOf(account.address).call())
+
+                withdraw_amount_wei = min(amount_wei, rieth_balance_wei)
+                if withdraw_amount_wei <= 0:
+                    log(
+                        "SKIP: no riETH available for withdraw after unwrap | ieth_balance=%s | rieth_balance=%s",
+                        format_dacc_wei(ieth_balance_wei, places=9),
+                        format_dacc_wei(rieth_balance_wei, places=9),
+                    )
+                    break
+
+                quote = rieth.functions.quoteWithdraw(recipient, withdraw_amount_wei, withdraw_options).call()
+                native_fee_wei = int(quote[0] if isinstance(quote, (list, tuple)) else getattr(quote, "nativeFee", 0))
+                if native_balance_wei < native_fee_wei + gas_reserve_wei:
+                    log(
+                        "SKIP: insufficient Ink ETH for Dinero withdraw fee | ink_eth_balance=%s | native_fee=%s | reserve=%s",
+                        format_dacc_wei(native_balance_wei, places=9),
+                        format_dacc_wei(native_fee_wei, places=9),
+                        format_dacc_wei(gas_reserve_wei, places=9),
+                    )
+                    break
+
+                function = rieth.functions.withdraw(recipient, account.address, withdraw_amount_wei, withdraw_options)
+                tx_hash, receipt, fee_wei = send_contract_tx(
+                    w3,
+                    account,
+                    function,
+                    settings,
+                    value_wei=native_fee_wei,
+                    gas_limit_override=withdraw_gas_limit,
+                    chain_id=INK_CHAIN_ID,
+                    fixed_gas_price_setting="ink_fixed_gas_price_gwei",
+                )
+                log(
+                    "DINERO RIETH WITHDRAW SENT | amount=%s riETH | percent=%.4f | native_fee=%s ETH | recipient=%s | tx_hash=%s | fee_estimate=%s ETH | note=LayerZero_mainnet_delivery",
+                    format_dacc_wei(withdraw_amount_wei, places=9),
+                    float(chosen_percent),
+                    format_dacc_wei(native_fee_wei, places=9),
+                    recipient,
+                    tx_hash,
+                    format_dacc_wei(fee_wei, places=9),
+                )
+                if getattr(receipt, "status", 0) != 1:
+                    raise RuntimeError(f"Dinero riETH withdraw reverted: {tx_hash}")
+                completed += 1
+            else:
+                log_error("DINERO RIETH ERROR | unknown operation=%s", operation)
+                return False
+
+            if tx_index < tx_count and delay_max > 0:
+                sleep_seconds = random.uniform(delay_min, delay_max)
+                log("Sleeping between Dinero riETH txs | seconds=%.2f", sleep_seconds)
+                time.sleep(sleep_seconds)
+        except TxSubmittedError as exc:
+            log_error("DINERO RIETH TX SUBMITTED BUT RECEIPT FAILED | tx=%s/%s | tx_hash=%s | %s", tx_index, tx_count, exc.tx_hash, exc)
+            completed += 1
+            break
+        except Exception as exc:
+            log_error("DINERO RIETH ERROR | tx=%s/%s | %s", tx_index, tx_count, exc)
+            break
+
+    log("DINERO RIETH RESULT | operation=%s | completed=%s/%s", operation, completed, tx_count)
+    return completed > 0
+
+
 def run_wallet(entry: WalletEntry, logger: logging.Logger) -> bool:
     settings = load_settings()
     run_logger = create_run_logger(entry.index, entry.address)
@@ -2512,6 +2806,8 @@ def run_all_wallets(logger: logging.Logger, mode: str, options: dict[str, Any] |
             result = run_wallet_robinhood_deposit(entry, logger, options or {})
         elif mode == "ink_withdraw":
             result = run_wallet_ink_withdraw(entry, logger, options or {})
+        elif mode == "dinero_rieth":
+            result = run_wallet_dinero_rieth(entry, logger, options or {})
         else:
             raise RuntimeError(f"Unknown mode: {mode}")
         if result:
@@ -2659,6 +2955,46 @@ def prompt_ink_withdraw_options() -> dict[str, Any]:
     }
 
 
+def prompt_dinero_rieth_options() -> dict[str, Any]:
+    settings = load_settings()
+    print()
+    print("DINERO RIETH")
+    print("1. Withdraw riETH to Ethereum via Dinero LayerZero")
+    print("2. Unwrap iETH -> riETH only")
+    operation_choice = input(f"Select operation [{settings.get('dinero_rieth_operation', 'withdraw')}]: ").strip().lower()
+    operation_map = {
+        "1": "withdraw",
+        "withdraw": "withdraw",
+        "rieth_withdraw": "withdraw",
+        "2": "unwrap",
+        "unwrap": "unwrap",
+        "unwrap_only": "unwrap",
+    }
+    operation = operation_map.get(operation_choice, str(settings.get("dinero_rieth_operation", "withdraw")).lower())
+
+    default_min = settings.get("dinero_rieth_percent_min", 80)
+    default_max = settings.get("dinero_rieth_percent_max", 95)
+    default_count = settings.get("dinero_rieth_transactions_count", 1)
+    percent_target = "iETH+riETH balance" if operation == "withdraw" else "iETH balance"
+    min_input = input(f"Min percent of {percent_target} [{default_min}]: ").strip()
+    max_input = input(f"Max percent of {percent_target} [{default_max}]: ").strip()
+    count_input = input(f"Transactions per wallet [{default_count}]: ").strip()
+    recipient_input = input("Ethereum recipient [same wallet]: ").strip() if operation == "withdraw" else ""
+
+    try:
+        tx_count = int(count_input or default_count)
+    except ValueError:
+        tx_count = int(default_count)
+
+    return {
+        "operation": operation,
+        "percent_min": parse_decimal(min_input or default_min, parse_decimal(default_min, Decimal("80"))),
+        "percent_max": parse_decimal(max_input or default_max, parse_decimal(default_max, Decimal("95"))),
+        "tx_count": max(tx_count, 1),
+        "recipient": recipient_input or None,
+    }
+
+
 def main() -> int:
     logger = setup_logging()
     ensure_layout()
@@ -2675,6 +3011,7 @@ def main() -> int:
         print("6. Hood Pix NFT")
         print("7. Deposit to Robinhood Chain")
         print("8. Withdraw from Ink")
+        print("9. Dinero riETH")
         print("0. Exit")
         print()
         choice = input("Select: ").strip()
@@ -2694,6 +3031,8 @@ def main() -> int:
             return run_all_wallets(logger, "robinhood_deposit", prompt_robinhood_deposit_options())
         if choice == "8":
             return run_all_wallets(logger, "ink_withdraw", prompt_ink_withdraw_options())
+        if choice == "9":
+            return run_all_wallets(logger, "dinero_rieth", prompt_dinero_rieth_options())
         return 0
     except Exception as exc:
         logger.exception("FATAL ERROR | %s", exc)
