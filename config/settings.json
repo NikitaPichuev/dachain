@@ -55,6 +55,18 @@
   "robinhood_deposit_gas_reserve_eth": "0.003",
   "delay_between_robinhood_deposits_min_seconds": 3,
   "delay_between_robinhood_deposits_max_seconds": 8,
+  "ink_rpc_urls": [
+    "https://rpc-gel.inkonchain.com",
+    "https://rpc-qnd.inkonchain.com"
+  ],
+  "ink_withdraw_percent_min": 80,
+  "ink_withdraw_percent_max": 95,
+  "ink_withdraw_transactions_count": 1,
+  "ink_withdraw_gas_limit": 180000,
+  "ink_withdraw_min_gas_limit": 200000,
+  "ink_withdraw_gas_reserve_eth": "0.00005",
+  "delay_between_ink_withdrawals_min_seconds": 3,
+  "delay_between_ink_withdrawals_max_seconds": 8,
   "exchange_operation": "burn",
   "exchange_percent_min": 5,
   "exchange_percent_max": 10,

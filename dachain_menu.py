@@ -34,12 +34,18 @@ ETHEREUM_MAINNET_RPC_URLS = [
     "https://ethereum-rpc.publicnode.com",
     "https://eth.llamarpc.com",
 ]
+INK_CHAIN_ID = 57073
+INK_RPC_URLS = [
+    "https://rpc-gel.inkonchain.com",
+    "https://rpc-qnd.inkonchain.com",
+]
 HOODPIX_CHAIN_ID = 4663
 HOODPIX_RPC_URLS = [
     "https://rpc.mainnet.chain.robinhood.com",
     "https://rpc.arrowrpc.com",
 ]
 ROBINHOOD_DELAYED_INBOX = "0x6bCBA7cD81a5f12c10ca1Bf9b36761CC382658E8"
+INK_L2_STANDARD_BRIDGE = "0x4200000000000000000000000000000000000010"
 HOODPIX_COLLECTION_CONTRACT = "0xb324301d3a3707de79e6dbab524e6c7fcc544ad2"
 HOODPIX_SEADROP_CONTRACT = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"
 HOODPIX_FEE_RECIPIENT = "0x0000a26b00c1F0DF003000390027140000fAa719"
@@ -250,6 +256,29 @@ ARBITRUM_DELAYED_INBOX_ABI: list[dict[str, Any]] = [
         "outputs": [{"name": "", "type": "uint256"}],
     }
 ]
+OP_L2_STANDARD_BRIDGE_ABI: list[dict[str, Any]] = [
+    {
+        "name": "bridgeETHTo",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "_to", "type": "address"},
+            {"name": "_minGasLimit", "type": "uint32"},
+            {"name": "_extraData", "type": "bytes"},
+        ],
+        "outputs": [],
+    },
+    {
+        "name": "bridgeETH",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {"name": "_minGasLimit", "type": "uint32"},
+            {"name": "_extraData", "type": "bytes"},
+        ],
+        "outputs": [],
+    },
+]
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -303,6 +332,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "robinhood_deposit_gas_reserve_eth": "0.003",
     "delay_between_robinhood_deposits_min_seconds": 3,
     "delay_between_robinhood_deposits_max_seconds": 8,
+    "ink_rpc_urls": INK_RPC_URLS,
+    "ink_withdraw_percent_min": 80,
+    "ink_withdraw_percent_max": 95,
+    "ink_withdraw_transactions_count": 1,
+    "ink_withdraw_gas_limit": 180000,
+    "ink_withdraw_min_gas_limit": 200000,
+    "ink_withdraw_gas_reserve_eth": "0.00005",
+    "delay_between_ink_withdrawals_min_seconds": 3,
+    "delay_between_ink_withdrawals_max_seconds": 8,
     "exchange_operation": "burn",
     "exchange_percent_min": 5,
     "exchange_percent_max": 10,
@@ -1535,6 +1573,132 @@ def run_wallet_robinhood_deposit(
     return completed > 0
 
 
+def run_wallet_ink_withdraw(
+    entry: WalletEntry,
+    logger: logging.Logger,
+    withdraw_options: dict[str, Any],
+) -> bool:
+    settings = load_settings()
+    run_logger = create_run_logger(entry.index, entry.address)
+    tx_count = max(int(withdraw_options.get("tx_count") or settings.get("ink_withdraw_transactions_count", 1)), 1)
+    percent_min, percent_max = normalize_percent_range(
+        withdraw_options.get("percent_min", settings.get("ink_withdraw_percent_min", 80)),
+        withdraw_options.get("percent_max", settings.get("ink_withdraw_percent_max", 95)),
+    )
+    recipient_input = str(withdraw_options.get("recipient") or "").strip()
+    recipient = recipient_input or entry.address
+    gas_reserve_wei = decimal_to_wei(parse_decimal(settings.get("ink_withdraw_gas_reserve_eth", "0.00005")))
+    gas_limit = int(settings.get("ink_withdraw_gas_limit", 180000))
+    min_gas_limit = int(settings.get("ink_withdraw_min_gas_limit", 200000))
+    delay_min = float(settings.get("delay_between_ink_withdrawals_min_seconds", 3))
+    delay_max = float(settings.get("delay_between_ink_withdrawals_max_seconds", 8))
+    if delay_max < delay_min:
+        delay_min, delay_max = delay_max, delay_min
+    rpc_urls = settings.get("ink_rpc_urls", INK_RPC_URLS)
+    if not isinstance(rpc_urls, list) or not rpc_urls:
+        rpc_urls = INK_RPC_URLS
+
+    def log(message: str, *args: Any) -> None:
+        logger.info(message, *args)
+        run_logger.info(message, *args)
+
+    def log_error(message: str, *args: Any) -> None:
+        logger.error(message, *args)
+        run_logger.error(message, *args)
+
+    log(
+        "Wallet #%s | mode=ink_withdraw | percent=%s-%s | tx_count=%s | address=%s | recipient=%s | proxy=%s",
+        entry.index,
+        percent_min,
+        percent_max,
+        tx_count,
+        entry.address,
+        recipient,
+        entry.proxy or "-",
+    )
+
+    try:
+        recipient = Web3.to_checksum_address(recipient)
+    except Exception as exc:
+        log_error("INK WITHDRAW RECIPIENT ERROR | recipient=%s | %s", recipient, exc)
+        return False
+
+    try:
+        w3, rpc_proxy, rpc_url = get_connected_web3_for_chain(
+            entry,
+            settings,
+            log,
+            log_error,
+            "INK WITHDRAW",
+            INK_CHAIN_ID,
+            [str(url) for url in rpc_urls],
+        )
+        if not w3:
+            return False
+        log("INK WITHDRAW RPC OK | rpc=%s | proxy=%s", rpc_url or "-", rpc_proxy or "-")
+        account = Account.from_key(entry.private_key if entry.private_key.startswith("0x") else f"0x{entry.private_key}")
+        bridge = w3.eth.contract(address=Web3.to_checksum_address(INK_L2_STANDARD_BRIDGE), abi=OP_L2_STANDARD_BRIDGE_ABI)
+    except Exception as exc:
+        log_error("INK WITHDRAW SETUP ERROR | %s", exc)
+        return False
+
+    completed = 0
+    for tx_index in range(1, tx_count + 1):
+        try:
+            balance_wei = w3.eth.get_balance(account.address)
+            spendable_wei = max(balance_wei - gas_reserve_wei, 0)
+            amount_wei, chosen_percent = random_percent_wei(spendable_wei, percent_min, percent_max)
+            log(
+                "Ink withdraw status | tx=%s/%s | eth_balance=%s | reserve=%s | amount=%s | percent=%.4f",
+                tx_index,
+                tx_count,
+                format_dacc_wei(balance_wei, places=9),
+                format_dacc_wei(gas_reserve_wei, places=9),
+                format_dacc_wei(amount_wei, places=9),
+                float(chosen_percent),
+            )
+            if amount_wei <= 0:
+                log("SKIP: insufficient ETH on Ink for withdrawal | eth_balance=%s", format_dacc_wei(balance_wei, places=9))
+                break
+            function = bridge.functions.bridgeETHTo(recipient, min_gas_limit, b"")
+            tx_hash, receipt, fee_wei = send_contract_tx(
+                w3,
+                account,
+                function,
+                settings,
+                value_wei=amount_wei,
+                gas_limit_override=gas_limit,
+                chain_id=INK_CHAIN_ID,
+                fixed_gas_price_setting="ink_fixed_gas_price_gwei",
+            )
+            log(
+                "INK WITHDRAW INITIATED | tx=%s/%s | amount=%s ETH | recipient=%s | tx_hash=%s | fee_estimate=%s ETH | note=requires_L1_finalization",
+                tx_index,
+                tx_count,
+                format_dacc_wei(amount_wei, places=9),
+                recipient,
+                tx_hash,
+                format_dacc_wei(fee_wei, places=9),
+            )
+            if getattr(receipt, "status", 0) != 1:
+                raise RuntimeError(f"Ink withdrawal transaction reverted: {tx_hash}")
+            completed += 1
+            if tx_index < tx_count and delay_max > 0:
+                sleep_seconds = random.uniform(delay_min, delay_max)
+                log("Sleeping between Ink withdrawals | seconds=%.2f", sleep_seconds)
+                time.sleep(sleep_seconds)
+        except TxSubmittedError as exc:
+            log_error("INK WITHDRAW TX SUBMITTED BUT RECEIPT FAILED | tx_hash=%s | %s", exc.tx_hash, exc)
+            completed += 1
+            break
+        except Exception as exc:
+            log_error("INK WITHDRAW ERROR | tx=%s/%s | %s", tx_index, tx_count, exc)
+            break
+
+    log("INK WITHDRAW RESULT | completed=%s/%s", completed, tx_count)
+    return completed > 0
+
+
 def run_wallet(entry: WalletEntry, logger: logging.Logger) -> bool:
     settings = load_settings()
     run_logger = create_run_logger(entry.index, entry.address)
@@ -2346,6 +2510,8 @@ def run_all_wallets(logger: logging.Logger, mode: str, options: dict[str, Any] |
             result = run_wallet_hoodpix_mint(entry, logger)
         elif mode == "robinhood_deposit":
             result = run_wallet_robinhood_deposit(entry, logger, options or {})
+        elif mode == "ink_withdraw":
+            result = run_wallet_ink_withdraw(entry, logger, options or {})
         else:
             raise RuntimeError(f"Unknown mode: {mode}")
         if result:
@@ -2467,6 +2633,32 @@ def prompt_robinhood_deposit_options() -> dict[str, Any]:
     }
 
 
+def prompt_ink_withdraw_options() -> dict[str, Any]:
+    settings = load_settings()
+    print()
+    print("INK WITHDRAW")
+    print("Native ETH withdrawal from Ink to Ethereum. L1 finalization is required later.")
+    default_min = settings.get("ink_withdraw_percent_min", 80)
+    default_max = settings.get("ink_withdraw_percent_max", 95)
+    default_count = settings.get("ink_withdraw_transactions_count", 1)
+    min_input = input(f"Min percent of Ink ETH balance [{default_min}]: ").strip()
+    max_input = input(f"Max percent of Ink ETH balance [{default_max}]: ").strip()
+    count_input = input(f"Transactions per wallet [{default_count}]: ").strip()
+    recipient_input = input("Ethereum recipient [same wallet]: ").strip()
+
+    try:
+        tx_count = int(count_input or default_count)
+    except ValueError:
+        tx_count = int(default_count)
+
+    return {
+        "percent_min": parse_decimal(min_input or default_min, parse_decimal(default_min, Decimal("80"))),
+        "percent_max": parse_decimal(max_input or default_max, parse_decimal(default_max, Decimal("95"))),
+        "tx_count": max(tx_count, 1),
+        "recipient": recipient_input or None,
+    }
+
+
 def main() -> int:
     logger = setup_logging()
     ensure_layout()
@@ -2482,6 +2674,7 @@ def main() -> int:
         print("5. Transactions")
         print("6. Hood Pix NFT")
         print("7. Deposit to Robinhood Chain")
+        print("8. Withdraw from Ink")
         print("0. Exit")
         print()
         choice = input("Select: ").strip()
@@ -2499,6 +2692,8 @@ def main() -> int:
             return run_all_wallets(logger, "hoodpix")
         if choice == "7":
             return run_all_wallets(logger, "robinhood_deposit", prompt_robinhood_deposit_options())
+        if choice == "8":
+            return run_all_wallets(logger, "ink_withdraw", prompt_ink_withdraw_options())
         return 0
     except Exception as exc:
         logger.exception("FATAL ERROR | %s", exc)

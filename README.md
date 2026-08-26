@@ -13,6 +13,7 @@ Automation tool for DACHAIN Inception testnet.
 - Native DACC transactions to unique external addresses
 - HOOD PIX public mint on Robinhood Chain through OpenSea SeaDrop
 - Native ETH deposit from Ethereum mainnet to Robinhood Chain
+- Native ETH withdrawal from Ink to Ethereum
 - Proxy support
 - Per-wallet logs
 
@@ -34,6 +35,7 @@ Automation tool for DACHAIN Inception testnet.
 5. Transactions
 6. Hood Pix NFT
 7. Deposit to Robinhood Chain
+8. Withdraw from Ink
 0. Exit
 ```
 
@@ -104,6 +106,25 @@ Default contract settings:
 Ethereum chain ID: 1
 Delayed Inbox:     0x6bCBA7cD81a5f12c10ca1Bf9b36761CC382658E8
 ```
+
+## Ink Withdrawal
+
+The Ink Withdraw menu initiates native ETH withdrawals from Ink to Ethereum
+through the OP Stack L2 Standard Bridge. The recipient defaults to the same
+wallet address, or you can enter another Ethereum address when prompted.
+
+This only starts the L2 withdrawal. OP Stack withdrawals are not instant and
+must be finalized on Ethereum later after the withdrawal period.
+
+Default contract settings:
+
+```text
+Ink chain ID:       57073
+L2 Standard Bridge: 0x4200000000000000000000000000000000000010
+```
+
+Token balances and protocol positions, for example Dinero staked riETH, are not
+withdrawn by this menu item.
 
 ## Settings
 
